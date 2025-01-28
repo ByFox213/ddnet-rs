@@ -668,6 +668,16 @@ pub struct ConfigServer {
     /// and local servers).
     #[default = false]
     pub auto_map_votes: bool,
+    /// Path to the map votes file.
+    #[default = "map_votes.json"]
+    pub map_votes_path: String,
+    /// Path to the server provided asset files.
+    /// The dictionary structure should match the one from
+    /// the data directory.
+    /// Assets include the hash in the file name.
+    /// An empty string disables server provided assets.
+    #[default = ""]
+    pub provided_assets_path: String,
     /// Whether to allow spatial chat on this server.
     /// Note that spatial chat causes lot of network
     /// traffic.

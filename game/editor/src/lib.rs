@@ -4,6 +4,7 @@
 pub mod action_logic;
 pub mod actions;
 pub mod client;
+pub mod dbg;
 pub mod editor;
 pub mod editor_ui;
 pub mod event;
@@ -13,6 +14,7 @@ pub mod map;
 pub mod map_tools;
 pub mod network;
 pub mod notifications;
+pub mod physics_layers;
 pub mod server;
 pub mod tab;
 pub mod tools;

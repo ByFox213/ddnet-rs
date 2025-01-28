@@ -30,7 +30,7 @@ members = [
     "lib/api-wasm-macros",
     "lib/api-macros",
     "lib/api-ui",
-    "lib/image",
+    "lib/image-utils",
     "lib/pool",
     "lib/sound",
     "lib/sql",
@@ -106,7 +106,7 @@ members = [
     "lib/steam",
     "game/game-state-wasm", "lib/native-display", "src/assets-server", "game/assets-base", "src/community-server",
     "src/community-register-server",
-    "game/community", "lib/input-binds", "game/ghost", "game/client-ghost", "game/client-replay", "game/editor-wasm", "game/client-notifications",
+    "game/community", "lib/input-binds", "game/ghost", "game/client-ghost", "game/client-replay", "game/editor-wasm", "game/client-notifications", "src/editor-server", "src/extra-convert",
 ]
 
 [package]
@@ -140,7 +140,7 @@ config-fs = { path = "lib/config-fs" }
 graphics = { path = "lib/graphics" }
 graphics-backend = { path = "lib/graphics-backend" }
 graphics-types = { path = "lib/graphics-types" }
-image = { path = "lib/image" }
+image-utils = { path = "lib/image-utils" }
 sound = { path = "lib/sound" }
 sound-backend = { path = "lib/sound-backend" }
 microphone = { path = "lib/microphone" }
@@ -202,9 +202,11 @@ rand = { version = "0.8.5", features = ["std_rng"], default-features = false }
 url = "2.5.4"
 log = "0.4.22"
 x509-cert = { version = "0.2.5" }
-alloc-track = { version = "0.3.1", optional = true }
 crossbeam = "0.8.4"
 chrono = { version = "0.4.39", features = ["serde"] }
+
+alloc-track = { version = "0.3.1", optional = true }
+stats_alloc = { version = "0.1.10", optional = true }
 
 # Better patches are always welcome
 #[target.'cfg(target_os = "windows")'.patch.crates-io]
@@ -236,7 +238,8 @@ enable_steam = ["steam/runtime"]
 microphone = ["microphone/cpal_opus"]
 ffmpeg = ["client-demo/ffmpeg"]
 
-alloc_track = ["alloc-track"]
+alloc_track = ["dep:alloc-track"]
+alloc_stats = ["dep:stats_alloc"]
 
 default = ["legacy"]
 

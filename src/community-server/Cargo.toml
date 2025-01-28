@@ -8,9 +8,9 @@ community = { path = "../../game/community" }
 
 base = { path = "../../lib/base" }
 network = { path = "../../lib/network" }
-sql = { path = "../../lib/sql" }
-game-database = { path = "../../lib/game-database" }
-game-database-backend = { path = "../../lib/game-database-backend" }
+sql = { path = "../../lib/sql", default-features = false, features = ["mysql"] }
+game-database = { path = "../../lib/game-database", default-features = false, features = ["mysql"] }
+game-database-backend = { path = "../../lib/game-database-backend", default-features = false, features = ["mysql"] }
 
 tokio = { version = "1.42.0", features = ["rt-multi-thread", "sync", "fs", "net", "time", "macros"] }
 anyhow = { version = "1.0.95", features = ["backtrace"] }
@@ -22,8 +22,8 @@ serde_json = "1.0.134"
 x509-cert = { version = "0.2.5" }
 log = "0.4.22"
 
-ddnet-account-client-http-fs = { version = "0.2.0" }
-ddnet-account-client-reqwest = "0.2.0"
+ddnet-account-client-http-fs = { version = "0.3.0" }
+ddnet-account-client-reqwest = "0.3.0"
 ddnet-accounts-shared = { version = "0.2.0" }
 ddnet-accounts-types = { version = "0.1.0" }
 ddnet-account-game-server = { version = "0.3.0" }

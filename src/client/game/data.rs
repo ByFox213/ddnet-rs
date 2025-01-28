@@ -13,6 +13,13 @@ use binds::binds::{
 };
 use client_types::console::{entries_to_parser, ConsoleEntry};
 use command_parser::parser::{self, Command, CommandType, ParserCache, Syn};
+use game_base::{
+    network::{
+        messages::{MsgClSnapshotAck, PlayerInputChainable},
+        types::chat::NetChatMsg,
+    },
+    player_input::PlayerInput,
+};
 use game_config::config::ConfigGame;
 use game_interface::{
     interface::GameStateServerOptions,
@@ -35,13 +42,6 @@ use pool::{
     rc::PoolRc,
 };
 use prediction_timer::prediction_timing::PredictionTimer;
-use game_base::{
-    network::{
-        messages::{MsgClSnapshotAck, PlayerInputChainable},
-        types::chat::NetChatMsg,
-    },
-    player_input::PlayerInput,
-};
 
 use crate::{
     client::input::input_handling::DeviceToLocalPlayerIndex,
@@ -162,6 +162,7 @@ pub struct GameData {
 
     pub prediction_timer: PredictionTimer,
     pub net_byte_stats: NetworkByteStats,
+    pub last_keep_alive_id_and_time: (Option<u64>, Duration),
 
     pub last_game_tick: Duration,
     pub last_frame_time: Duration,
@@ -230,6 +231,8 @@ impl GameData {
             player_snap_pool: Pool::with_capacity(2),
             player_inputs_state_pool: Pool::with_capacity(2),
             player_ids_pool: Pool::with_capacity(4),
+
+            last_keep_alive_id_and_time: (None, cur_time),
 
             vote: None,
             map_votes: Default::default(),
@@ -458,7 +461,7 @@ impl GameData {
         binds: &mut Binds<Vec<BindAction>>,
         is_dummy: bool,
         console_entries: &[ConsoleEntry],
-        cache: &mut ParserCache,
+        cache: &ParserCache,
     ) {
         let map = gen_local_player_action_hash_map();
 
@@ -510,7 +513,7 @@ impl GameData {
         config: &mut ConfigGame,
         console_entries: &[ConsoleEntry],
         mut snap_local_players: SnapshotLocalPlayers,
-        cache: &mut ParserCache,
+        cache: &ParserCache,
         options: &GameStateServerOptions,
     ) {
         local_players.retain_with_order(|player_id, _| {
@@ -709,5 +712,10 @@ impl GameData {
                 *last_hammer = Some(cur_time);
             }
         }
+    }
+
+    /// Whether the connection to the server is most likely dead
+    pub fn is_likely_distconnected(&self, now: Duration) -> bool {
+        now.saturating_sub(self.last_keep_alive_id_and_time.1) > Duration::from_secs(4)
     }
 }

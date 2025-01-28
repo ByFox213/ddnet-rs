@@ -6,6 +6,7 @@ use client_containers::{
     ninja::Ninja,
     weapons::Weapons,
 };
+use game_base::game_types::intra_tick_time_to_ratio;
 use game_interface::types::{
     emoticons::{EnumCount, IntoEnumIterator},
     game::NonZeroGameTickType,
@@ -33,7 +34,6 @@ use math::math::{
     vector::{dvec2, ubvec4, vec2},
     Rng, RngSlice, PI, PI_F64,
 };
-use game_base::game_types::intra_tick_time_to_ratio;
 use vanilla::weapons::definitions::weapon_def::{
     get_ninja_sprite_scale, get_scale, get_weapon_sprite_scale, get_weapon_visual_scale,
     NINJA_PICKUP_VISUAL_SIZE, NINJA_WEAPON_VISUAL_SIZE,
@@ -364,13 +364,7 @@ impl ToolkitRender {
         quad_scope: DrawScope<4>,
     ) {
         // normal weapons
-        let texture = match weapon_type {
-            WeaponType::Hammer => &weapons.hammer.weapon.tex,
-            WeaponType::Gun => &weapons.gun.tex,
-            WeaponType::Shotgun => &weapons.shotgun.weapon.tex,
-            WeaponType::Grenade => &weapons.grenade.weapon.tex,
-            WeaponType::Laser => &weapons.laser.weapon.tex,
-        };
+        let texture = &weapons.by_type(*weapon_type).tex;
 
         let quad_offset = if cursor_dir.x >= 0.0 {
             self.weapon_quad_offsets[*weapon_type as usize].0
@@ -493,12 +487,12 @@ impl ToolkitRender {
         // muzzle if weapon is firing
         if current_weapon == WeaponType::Gun || current_weapon == WeaponType::Shotgun {
             // check if we're firing stuff
-            let (weapon, spec) = if current_weapon == WeaponType::Gun {
-                (&weapons.gun, WeaponGunSpec::get())
+            let (muzzles, spec) = if current_weapon == WeaponType::Gun {
+                (&weapons.gun.muzzles.muzzles, WeaponGunSpec::get())
             } else {
-                (&weapons.shotgun.weapon, WeaponShotgunSpec::get())
+                (&weapons.shotgun.muzzles.muzzles, WeaponShotgunSpec::get())
             };
-            if !weapon.muzzles.is_empty() {
+            if !muzzles.is_empty() {
                 let mut alpha_muzzle = 0.0;
                 let muzzle_duration = 8.0 / 5.0; // TODO: move this into the weapon spec
                 let attack_time = attack_time
@@ -521,7 +515,7 @@ impl ToolkitRender {
                     let muzzle_pos =
                         weapon_pos + dir * spec.muzzle_offset_x + muzzle_dir_y * pos_offset_y;
 
-                    let texture = weapon.muzzles.random_entry(&mut self.rng);
+                    let texture = muzzles.random_entry(&mut self.rng);
 
                     self.quad_container.render_quad_container_as_sprite(
                         quad_offset,

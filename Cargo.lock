@@ -974,6 +974,7 @@ dependencies = [
  "client-types",
  "command-parser",
  "game-interface",
+ "hiarc",
  "input-binds",
  "log",
  "serde_json",
@@ -1539,7 +1540,7 @@ dependencies = [
  "graphics-types",
  "hashlink 0.9.1 (git+https://github.com/Jupeyy/hashlink/?branch=ddnet)",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
  "log",
  "math",
  "num-traits",
@@ -1692,7 +1693,7 @@ dependencies = [
  "graphics-types",
  "hashlink 0.9.1 (git+https://github.com/Jupeyy/hashlink/?branch=ddnet)",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
  "log",
  "map",
  "math",
@@ -1796,7 +1797,7 @@ dependencies = [
  "graphics-types",
  "hashlink 0.9.1 (git+https://github.com/Jupeyy/hashlink/?branch=ddnet)",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
  "log",
  "master-server-types",
  "math",
@@ -2592,9 +2593,9 @@ dependencies = [
 
 [[package]]
 name = "ddnet-account-client-http-fs"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9eb10f67107b4b13dd29cec53fbb85c1929bb74bf0d09553a8e70284feed358"
+checksum = "9004caaafde669225232a14ade28e7f972a9f42ed2d044e6b6ee1243a167d25d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2616,9 +2617,9 @@ dependencies = [
 
 [[package]]
 name = "ddnet-account-client-reqwest"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6603dcf4551e39428598ab96ffe5dc9612a1c55da1645725c338207838c81411"
+checksum = "bc5b16d118b5a2f4f83b6827972fb12d22e104d5c786e716ef450cbba4b66685"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2748,7 +2749,7 @@ dependencies = [
  "graphics-types",
  "hashlink 0.9.1 (git+https://github.com/Jupeyy/hashlink/?branch=ddnet)",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
  "input-binds",
  "log",
  "map",
@@ -2768,6 +2769,7 @@ dependencies = [
  "serde_json",
  "sound",
  "sound-backend",
+ "stats_alloc",
  "steam",
  "thread-priority",
  "tokio",
@@ -3009,8 +3011,7 @@ name = "dilate"
 version = "0.1.0"
 dependencies = [
  "clap 4.5.23",
- "graphics",
- "image 0.1.0",
+ "image-utils",
  "oxipng",
  "rayon",
  "tokio",
@@ -3220,13 +3221,16 @@ dependencies = [
  "egui-timeline",
  "egui_commonmark",
  "egui_extras",
+ "enum_dispatch",
  "game-base",
  "game-config",
  "game-interface",
  "graphics",
  "graphics-types",
+ "hashlink 0.9.1 (git+https://github.com/Jupeyy/hashlink/?branch=ddnet)",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
+ "log",
  "map",
  "map-convert-lib",
  "math",
@@ -3257,6 +3261,35 @@ dependencies = [
  "rayon",
  "sound",
  "ui-base",
+]
+
+[[package]]
+name = "editor-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base",
+ "base-fs",
+ "base-http",
+ "base-io",
+ "chrono",
+ "clap 4.5.23",
+ "config",
+ "ed25519-dalek",
+ "editor",
+ "env_logger",
+ "graphics",
+ "graphics-backend",
+ "graphics-base-traits",
+ "graphics-types",
+ "log",
+ "network",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sound",
+ "sound-backend",
+ "x509-cert",
 ]
 
 [[package]]
@@ -3403,7 +3436,7 @@ dependencies = [
  "ahash 0.8.11",
  "egui",
  "enum-map",
- "image 0.25.5",
+ "image",
  "log",
  "mime_guess2",
  "profiling",
@@ -3498,7 +3531,7 @@ version = "0.1.0"
 dependencies = [
  "clap 4.5.23",
  "client-extra",
- "image 0.1.0",
+ "image-utils",
  "tar",
 ]
 
@@ -3566,6 +3599,18 @@ checksum = "1bf1fa3f06bbff1ea5b1a9c7b14aa992a39657db60a2759457328d7e058f49ee"
 dependencies = [
  "num-bigint",
  "num-traits",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.94",
+]
+
+[[package]]
+name = "enum_dispatch"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
+dependencies = [
+ "once_cell",
  "proc-macro2",
  "quote",
  "syn 2.0.94",
@@ -3693,6 +3738,16 @@ name = "extended"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
+
+[[package]]
+name = "extra-convert"
+version = "0.1.0"
+dependencies = [
+ "clap 4.5.23",
+ "client-extra",
+ "image-utils",
+ "tar",
+]
 
 [[package]]
 name = "fallible-iterator"
@@ -4022,14 +4077,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base",
+ "command-parser",
+ "config",
  "flate2",
  "game-config",
  "game-interface",
  "graphics-types",
  "hashlink 0.9.1 (git+https://github.com/Jupeyy/hashlink/?branch=ddnet)",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
  "indexmap 2.7.0",
+ "itertools 0.13.0",
  "map",
  "math",
  "num-derive",
@@ -4069,7 +4127,7 @@ version = "0.1.0"
 dependencies = [
  "clap 4.5.23",
  "client-extra",
- "image 0.1.0",
+ "image-utils",
  "tar",
 ]
 
@@ -4376,7 +4434,7 @@ dependencies = [
  "graphics-base-traits",
  "graphics-types",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
  "math",
  "pool",
  "rayon",
@@ -4467,7 +4525,7 @@ dependencies = [
  "graphics-base-traits",
  "graphics-types",
  "hiarc",
- "image 0.1.0",
+ "image-utils",
  "math",
  "num-derive",
  "num-traits",
@@ -4867,7 +4925,7 @@ version = "0.1.0"
 dependencies = [
  "clap 4.5.23",
  "client-extra",
- "image 0.1.0",
+ "image-utils",
  "tar",
 ]
 
@@ -5205,14 +5263,6 @@ dependencies = [
 
 [[package]]
 name = "image"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "png",
-]
-
-[[package]]
-name = "image"
 version = "0.25.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd6f44aed642f18953a158afeb30206f4d50da59fbc66ecb53c66488de73563b"
@@ -5220,6 +5270,16 @@ dependencies = [
  "bytemuck",
  "byteorder-lite",
  "num-traits",
+]
+
+[[package]]
+name = "image-utils"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "png",
+ "rayon",
 ]
 
 [[package]]
@@ -5872,6 +5932,7 @@ dependencies = [
  "ruzstd 0.8.0",
  "serde",
  "serde_json",
+ "serde_with",
  "time",
  "zstd",
 ]
@@ -5903,7 +5964,7 @@ dependencies = [
  "base-io",
  "difference",
  "game-base",
- "image 0.1.0",
+ "image-utils",
  "map",
  "ogg-opus",
  "oxipng",
@@ -7017,7 +7078,7 @@ version = "0.1.0"
 dependencies = [
  "clap 4.5.23",
  "client-extra",
- "image 0.1.0",
+ "image-utils",
  "tar",
 ]
 
@@ -8664,7 +8725,7 @@ version = "0.1.0"
 dependencies = [
  "clap 4.5.23",
  "client-extra",
- "image 0.1.0",
+ "image-utils",
 ]
 
 [[package]]
@@ -9077,6 +9138,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "stats_alloc"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "steam"

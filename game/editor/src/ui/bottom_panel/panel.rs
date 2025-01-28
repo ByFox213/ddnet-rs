@@ -1,9 +1,12 @@
-use egui::{text::LayoutJob, Color32};
+use egui::{text::LayoutJob, Button, Color32};
 use egui_extras::Size;
 use math::math::vector::vec2;
 use ui_base::types::{UiRenderPipe, UiState};
 
-use crate::{ui::user_data::UserDataWithTab, utils::ui_pos_to_world_pos};
+use crate::{
+    ui::user_data::{EditorUiEvent, UserDataWithTab},
+    utils::ui_pos_to_world_pos,
+};
 
 pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_state: &mut UiState) {
     let editor_tab = &mut *pipe.user_data.editor_tab;
@@ -35,7 +38,12 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                                         editor_tab.map.user.ui_values.animations_panel_open =
                                             !editor_tab.map.user.ui_values.animations_panel_open;
                                     }
-                                    if ui.button("Server settings").clicked() {
+                                    if ui
+                                        .add(Button::new("Server settings").selected(
+                                            editor_tab.map.user.ui_values.server_settings_open,
+                                        ))
+                                        .clicked()
+                                    {
                                         editor_tab.map.user.ui_values.server_settings_open =
                                             !editor_tab.map.user.ui_values.server_settings_open;
                                     }
@@ -146,6 +154,10 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                                                     egui::TextFormat::default(),
                                                 );
                                                 ui.label(layout);
+
+                                                pipe.user_data
+                                                    .ui_events
+                                                    .push(EditorUiEvent::CursorWorldPos { pos });
                                             }
                                         });
                                     });

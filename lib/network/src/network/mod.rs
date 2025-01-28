@@ -23,6 +23,7 @@ pub mod utils;
 #[cfg(test)]
 pub mod tests {
     use std::{
+        borrow::Cow,
         num::NonZeroUsize,
         sync::{
             atomic::{AtomicBool, AtomicUsize},
@@ -339,7 +340,7 @@ pub mod tests {
             &sys,
             NetworkClientInitOptions::new(
                 NetworkClientCertCheckMode::CheckByPubKeyHash {
-                    hash: &server_pub_key_hash,
+                    hash: Cow::Borrowed(&server_pub_key_hash),
                 },
                 NetworkClientCertMode::FromCertAndPrivateKey {
                     cert: client_cert,
@@ -433,7 +434,7 @@ pub mod tests {
             {
                 notifier_server.wait_for_event(None);
             }
-            // reliable in order a on different channel
+            // reliable in order an on different channel
             *game_event_generator_server.cur_test_name.blocking_lock() =
                 "reliable in order on different channel".to_string();
             for channel in 10..12 {
@@ -823,7 +824,7 @@ pub mod tests {
             &sys,
             NetworkClientInitOptions::new(
                 NetworkClientCertCheckMode::CheckByPubKeyHash {
-                    hash: &server_pub_key_hash,
+                    hash: Cow::Borrowed(&server_pub_key_hash),
                 },
                 NetworkClientCertMode::FromCertAndPrivateKey {
                     cert: client_cert,

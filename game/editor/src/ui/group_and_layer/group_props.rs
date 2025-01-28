@@ -1,3 +1,6 @@
+use std::ops::RangeInclusive;
+
+use egui::{Checkbox, DragValue};
 use map::{map::groups::layers::tiles::MapTileLayerPhysicsTiles, types::NonZeroU16MinusOne};
 use math::math::vector::{ffixed, uffixed};
 use ui_base::{
@@ -7,11 +10,101 @@ use ui_base::{
 
 use crate::{
     actions::actions::{
-        ActAddRemGroup, ActChangeGroupAttr, ActChangePhysicsGroupAttr, ActRemGroup, EditorAction,
+        ActAddRemGroup, ActChangeGroupAttr, ActChangeGroupName, ActChangePhysicsGroupAttr,
+        ActMoveGroup, ActRemGroup, EditorAction,
     },
-    map::{EditorMapInterface, EditorPhysicsLayer},
+    map::{EditorGroups, EditorMap, EditorMapInterface, EditorPhysicsLayer},
     ui::{group_and_layer::shared::copy_tiles, user_data::UserDataWithTab},
 };
+
+#[derive(Debug)]
+enum MoveGroup {
+    IsBackground(bool),
+    Group(usize),
+}
+
+fn render_group_move(
+    ui: &mut egui::Ui,
+    is_background: bool,
+    g: usize,
+
+    can_bg: bool,
+    g_range: RangeInclusive<usize>,
+) -> Option<MoveGroup> {
+    let mut move_group = None;
+
+    let mut new_is_background = is_background;
+    ui.label("In background");
+    if ui
+        .add_enabled(can_bg, Checkbox::new(&mut new_is_background, ""))
+        .changed()
+    {
+        move_group = Some(MoveGroup::IsBackground(new_is_background));
+    }
+    ui.end_row();
+
+    ui.label("Group");
+    let mut new_group = g;
+    if ui
+        .add_enabled(
+            *g_range.start() != *g_range.end(),
+            DragValue::new(&mut new_group).update_while_editing(false),
+        )
+        .changed()
+    {
+        move_group = Some(MoveGroup::Group(new_group));
+    }
+    ui.end_row();
+
+    move_group
+}
+
+fn group_move_to_act(
+    mv: MoveGroup,
+    is_background: bool,
+    g: usize,
+    map: &EditorMap,
+) -> Option<ActMoveGroup> {
+    match mv {
+        MoveGroup::IsBackground(new_is_background) => {
+            if new_is_background == is_background {
+                return None;
+            }
+            let groups = if new_is_background {
+                &map.groups.background
+            } else {
+                &map.groups.foreground
+            };
+            Some(ActMoveGroup {
+                old_is_background: is_background,
+                old_group: g,
+                new_is_background,
+                new_group: groups.len(),
+            })
+        }
+        MoveGroup::Group(new_group) => {
+            if new_group == g {
+                return None;
+            }
+            let groups = if is_background {
+                &map.groups.background
+            } else {
+                &map.groups.foreground
+            };
+
+            if new_group < g || new_group < groups.len() {
+                Some(ActMoveGroup {
+                    old_is_background: is_background,
+                    old_group: g,
+                    new_is_background: is_background,
+                    new_group,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
 
 pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_state: &mut UiState) {
     #[derive(Debug, PartialEq, Eq)]
@@ -71,37 +164,67 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
             attr_mode = GroupAttrMode::DesignAndPhysicsMulti;
         }
     }
+    fn move_limits(groups: &EditorGroups, is_background: bool) -> (bool, RangeInclusive<usize>) {
+        (
+            {
+                let groups = if !is_background {
+                    &groups.background
+                } else {
+                    &groups.foreground
+                };
+                !groups.is_empty()
+            },
+            {
+                let groups = if is_background {
+                    &groups.background
+                } else {
+                    &groups.foreground
+                };
+                0..=groups.len().saturating_sub(1)
+            },
+        )
+    }
 
     let mut bg_selection = map
         .groups
         .background
-        .iter_mut()
+        .iter()
         .enumerate()
         .filter(|(_, bg)| bg.user.selected.is_some())
-        .map(|(g, bg)| (true, g, bg));
+        .map(|(g, _)| (true, g));
     let mut fg_selection = map
         .groups
         .foreground
-        .iter_mut()
+        .iter()
         .enumerate()
         .filter(|(_, fg)| fg.user.selected.is_some())
-        .map(|(g, bg)| (false, g, bg));
+        .map(|(g, _)| (false, g));
     let window_res = match attr_mode {
         GroupAttrMode::Design => {
-            let (is_background, g, group) = bg_selection
+            let (is_background, g) = bg_selection
                 .next()
                 .unwrap_or_else(|| fg_selection.next().unwrap());
+            let (bg_move_limit, g_limit) = move_limits(&map.groups, is_background);
+            let group = if is_background {
+                &mut map.groups.background[g]
+            } else {
+                &mut map.groups.foreground[g]
+            };
 
             let window = egui::Window::new("Design Group Attributes")
                 .resizable(false)
                 .collapsible(false);
 
+            // render group attributes
+            let group_editor = group.user.selected.as_mut().unwrap();
+            let attr = &mut group_editor.attr;
+            let attr_cmp = *attr;
+            let name_cmp = group_editor.name.clone();
+
+            let mut delete_group = false;
+            let mut move_group = None;
+
             let res = window.show(ui.ctx(), |ui| {
-                // render group attributes
-                let group_editor = group.user.selected.as_mut().unwrap();
-                let attr = &mut group_editor.attr;
-                let attr_cmp = *attr;
-                let mut delete_group = false;
                 egui::Grid::new("design group attr grid")
                     .num_columns(2)
                     .spacing([20.0, 4.0])
@@ -109,25 +232,25 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                         // pos x
                         ui.label("Pos x");
                         let mut x = attr.offset.x.to_num::<f64>();
-                        ui.add(egui::DragValue::new(&mut x));
+                        ui.add(egui::DragValue::new(&mut x).update_while_editing(false));
                         attr.offset.x = ffixed::from_num(x);
                         ui.end_row();
                         // pos y
                         ui.label("Pos y");
                         let mut y = attr.offset.y.to_num::<f64>();
-                        ui.add(egui::DragValue::new(&mut y));
+                        ui.add(egui::DragValue::new(&mut y).update_while_editing(false));
                         attr.offset.y = ffixed::from_num(y);
                         ui.end_row();
                         // para x
                         ui.label("Parallax x");
                         let mut x = attr.parallax.x.to_num::<f64>();
-                        ui.add(egui::DragValue::new(&mut x));
+                        ui.add(egui::DragValue::new(&mut x).update_while_editing(false));
                         attr.parallax.x = ffixed::from_num(x);
                         ui.end_row();
                         // para y
                         ui.label("Parallax y");
                         let mut y = attr.parallax.y.to_num::<f64>();
-                        ui.add(egui::DragValue::new(&mut y));
+                        ui.add(egui::DragValue::new(&mut y).update_while_editing(false));
                         attr.parallax.y = ffixed::from_num(y);
                         ui.end_row();
                         // clipping on/off
@@ -146,25 +269,33 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             // clipping x
                             ui.label("Clipping - x");
                             let mut x = clipping.pos.x.to_num::<f64>();
-                            ui.add(egui::DragValue::new(&mut x));
+                            ui.add(egui::DragValue::new(&mut x).update_while_editing(false));
                             clipping.pos.x = ffixed::from_num(x);
                             ui.end_row();
                             // clipping y
                             ui.label("Clipping - y");
                             let mut y = clipping.pos.y.to_num::<f64>();
-                            ui.add(egui::DragValue::new(&mut y));
+                            ui.add(egui::DragValue::new(&mut y).update_while_editing(false));
                             clipping.pos.y = ffixed::from_num(y);
                             ui.end_row();
                             // clipping w
                             ui.label("Clipping - width");
                             let mut x = clipping.size.x.to_num::<f64>();
-                            ui.add(egui::DragValue::new(&mut x).range(0.0..=f64::MAX));
+                            ui.add(
+                                egui::DragValue::new(&mut x)
+                                    .update_while_editing(false)
+                                    .range(0.0..=f64::MAX),
+                            );
                             clipping.size.x = uffixed::from_num(x);
                             ui.end_row();
                             // clipping h
                             ui.label("Clipping - height");
                             let mut y = clipping.size.y.to_num::<f64>();
-                            ui.add(egui::DragValue::new(&mut y).range(0.0..=f64::MAX));
+                            ui.add(
+                                egui::DragValue::new(&mut y)
+                                    .update_while_editing(false)
+                                    .range(0.0..=f64::MAX),
+                            );
                             clipping.size.y = uffixed::from_num(y);
                             ui.end_row();
                         }
@@ -177,31 +308,53 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             delete_group = true;
                         }
                         ui.end_row();
-                    });
 
-                if *attr != attr_cmp {
-                    tab.client.execute(
-                        EditorAction::ChangeGroupAttr(ActChangeGroupAttr {
-                            is_background,
-                            group_index: g,
-                            old_attr: group.attr,
-                            new_attr: *attr,
-                        }),
-                        Some(&format!("change-design-group-attr-{is_background}-{g}")),
-                    );
-                } else if delete_group {
-                    tab.client.execute(
-                        EditorAction::RemGroup(ActRemGroup {
-                            base: ActAddRemGroup {
-                                is_background,
-                                index: g,
-                                group: group.clone().into(),
-                            },
-                        }),
-                        None,
-                    );
-                }
+                        ui.label("Move group");
+                        ui.end_row();
+
+                        // group moving
+                        move_group =
+                            render_group_move(ui, is_background, g, bg_move_limit, g_limit);
+                    });
             });
+
+            if *attr != attr_cmp {
+                tab.client.execute(
+                    EditorAction::ChangeGroupAttr(ActChangeGroupAttr {
+                        is_background,
+                        group_index: g,
+                        old_attr: group.attr,
+                        new_attr: *attr,
+                    }),
+                    Some(&format!("change-design-group-attr-{is_background}-{g}")),
+                );
+            } else if group_editor.name != name_cmp {
+                tab.client.execute(
+                    EditorAction::ChangeGroupName(ActChangeGroupName {
+                        is_background,
+                        group_index: g,
+                        old_name: group.name.clone(),
+                        new_name: group_editor.name.clone(),
+                    }),
+                    Some(&format!("change-design-group-name-{is_background}-{g}")),
+                );
+            } else if delete_group {
+                tab.client.execute(
+                    EditorAction::RemGroup(ActRemGroup {
+                        base: ActAddRemGroup {
+                            is_background,
+                            index: g,
+                            group: group.clone().into(),
+                        },
+                    }),
+                    None,
+                );
+            } else if let Some(move_act) =
+                move_group.and_then(|mv| group_move_to_act(mv, is_background, g, map))
+            {
+                tab.client.execute(EditorAction::MoveGroup(move_act), None);
+            }
+
             res
         }
         GroupAttrMode::Physics => {
@@ -218,17 +371,27 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                         .show(ui, |ui| {
                             // render physics group attributes
                             let attr = group.user.selected.as_mut().unwrap();
-                            let attr_cmp = attr.clone();
+                            let attr_cmp = *attr;
                             // w
                             ui.label("width");
                             let mut w = attr.width.get();
-                            ui.add(egui::DragValue::new(&mut w).range(1..=u16::MAX - 1));
+                            ui.add(
+                                egui::DragValue::new(&mut w)
+                                    .update_while_editing(false)
+                                    .update_while_editing(false)
+                                    .range(1..=u16::MAX - 1),
+                            );
                             attr.width = NonZeroU16MinusOne::new(w).unwrap();
                             ui.end_row();
                             // h
                             ui.label("height");
                             let mut h = attr.height.get();
-                            ui.add(egui::DragValue::new(&mut h).range(1..=u16::MAX - 1));
+                            ui.add(
+                                egui::DragValue::new(&mut h)
+                                    .update_while_editing(false)
+                                    .update_while_editing(false)
+                                    .range(1..=u16::MAX - 1),
+                            );
                             attr.height = NonZeroU16MinusOne::new(h).unwrap();
                             ui.end_row();
                             if *attr != attr_cmp {
@@ -274,8 +437,8 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                                 tab.client.execute(
                                     EditorAction::ChangePhysicsGroupAttr(
                                         ActChangePhysicsGroupAttr {
-                                            old_attr: group.attr.clone(),
-                                            new_attr: attr.clone(),
+                                            old_attr: group.attr,
+                                            new_attr: *attr,
 
                                             new_layer_tiles: {
                                                 let width_or_height_change = group.attr.width

@@ -24,13 +24,22 @@ impl NetworkConnectionId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConnectionStats {
     pub ping: Duration,
     pub packets_lost: u64,
     pub packets_sent: u64,
     pub bytes_sent: u64,
     pub bytes_recv: u64,
+
+    /// If keep alives are used on the peer side,
+    /// then this id will change based on the keep
+    /// alive interval.
+    ///
+    /// So if the server does keep alives of 1 second,
+    /// then the client sees a change in this value around
+    /// every second.
+    pub last_keep_alive_id: u64,
 }
 
 #[derive(Debug)]

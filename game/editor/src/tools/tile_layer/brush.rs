@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{cell::Cell, collections::HashSet, rc::Rc, sync::Arc};
 
 use client_containers::{container::ContainerKey, entities::EntitiesContainer};
 use client_render_base::map::{
@@ -8,7 +8,7 @@ use client_render_base::map::{
     map_pipeline::{MapGraphics, TileLayerDrawInfo},
     render_tools::{CanvasType, RenderTools},
 };
-use egui::pos2;
+use egui::{pos2, Rect};
 use graphics::{
     graphics_mt::GraphicsMultiThreaded,
     handles::{
@@ -33,6 +33,7 @@ use map::{
 };
 use math::math::vector::{dvec2, ivec2, ubvec4, usvec2, vec2, vec4};
 use pool::mt_datatypes::PoolVec;
+use rand::RngCore;
 
 use crate::{
     actions::actions::{
@@ -45,8 +46,10 @@ use crate::{
         finish_design_tile_layer_buffer, finish_physics_layer_buffer,
         upload_design_tile_layer_buffer, upload_physics_layer_buffer,
     },
+    physics_layers::PhysicsLayerOverlaysDdnet,
     tools::utils::{
-        render_filled_rect, render_filled_rect_from_state, render_rect, render_rect_from_state,
+        render_checkerboard_background, render_filled_rect, render_filled_rect_from_state,
+        render_rect, render_rect_from_state,
     },
     utils::{ui_pos_to_world_pos, UiCanvasSize},
 };
@@ -62,6 +65,28 @@ pub enum BrushVisual {
     Physics(PhysicsTileLayerVisuals),
 }
 
+#[derive(Debug, Hiarc, Clone, Copy, PartialEq, Eq)]
+pub enum TileBrushLastApplyLayer {
+    Physics {
+        layer_index: usize,
+    },
+    Design {
+        group_index: usize,
+        layer_index: usize,
+        is_background: bool,
+    },
+}
+
+#[derive(Debug, Hiarc, Clone, Copy, PartialEq, Eq)]
+pub struct TileBrushLastApply {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+
+    pub layer: TileBrushLastApplyLayer,
+}
+
 #[derive(Debug, Hiarc)]
 pub struct TileBrushTiles {
     pub tiles: MapTileLayerTiles,
@@ -74,12 +99,16 @@ pub struct TileBrushTiles {
     pub render: BrushVisual,
     pub map_render: MapGraphics,
     pub texture: TextureContainer2dArray,
+
+    pub last_apply: Cell<Option<TileBrushLastApply>>,
 }
 
 #[derive(Debug, Hiarc)]
 pub struct TileBrushTilePicker {
     pub render: TileLayerVisuals,
     pub map_render: MapGraphics,
+
+    physics_overlay: Rc<PhysicsLayerOverlaysDdnet>,
 }
 
 impl TileBrushTilePicker {
@@ -87,6 +116,7 @@ impl TileBrushTilePicker {
         graphics_mt: &GraphicsMultiThreaded,
         buffer_object_handle: &GraphicsBufferObjectHandle,
         backend_handle: &GraphicsBackendHandle,
+        physics_overlay: Rc<PhysicsLayerOverlaysDdnet>,
     ) -> Self {
         let map_render = MapGraphics::new(backend_handle);
 
@@ -97,6 +127,7 @@ impl TileBrushTilePicker {
                 backend_handle,
             ),
             map_render,
+            physics_overlay,
         }
     }
 }
@@ -115,6 +146,9 @@ pub struct TileBrush {
 
     pub pointer_down_world_pos: Option<TileBrushDownPos>,
     pub shift_pointer_down_world_pos: Option<TileBrushDownPos>,
+
+    /// Random id counted up, used for action identifiers
+    pub brush_id_counter: u128,
 }
 
 impl TileBrush {
@@ -122,6 +156,7 @@ impl TileBrush {
         graphics_mt: &GraphicsMultiThreaded,
         buffer_object_handle: &GraphicsBufferObjectHandle,
         backend_handle: &GraphicsBackendHandle,
+        physics_overlay: &Rc<PhysicsLayerOverlaysDdnet>,
     ) -> Self {
         Self {
             brush: None,
@@ -130,10 +165,14 @@ impl TileBrush {
                 graphics_mt,
                 buffer_object_handle,
                 backend_handle,
+                physics_overlay.clone(),
             ),
 
             pointer_down_world_pos: None,
             shift_pointer_down_world_pos: None,
+
+            brush_id_counter: ((rand::rngs::OsRng.next_u64() as u128) << 64)
+                + rand::rngs::OsRng.next_u64() as u128,
         }
     }
 
@@ -176,6 +215,44 @@ impl TileBrush {
                 finish_physics_layer_buffer(buffer_object_handle, backend_handle, buffer)
             }),
         }
+    }
+
+    fn selected_tiles_picker(pointer_rect: Rect, render_rect: Rect) -> (Vec<u8>, usize, usize) {
+        let mut brush_width = 0;
+        let mut brush_height = 0;
+        let mut tile_indices: Vec<u8> = Default::default();
+        // handle pointer position inside the available rect
+        if pointer_rect.intersects(render_rect) {
+            // determine tile
+            let size_of_tile = render_rect.width() / 16.0;
+            let x0 = pointer_rect.min.x.max(render_rect.min.x) - render_rect.min.x;
+            let y0 = pointer_rect.min.y.max(render_rect.min.y) - render_rect.min.y;
+            let mut x1 = pointer_rect.max.x.min(render_rect.max.x) - render_rect.min.x;
+            let mut y1 = pointer_rect.max.y.min(render_rect.max.y) - render_rect.min.y;
+
+            let x0 = (x0 / size_of_tile).rem_euclid(16.0) as usize;
+            let y0 = (y0 / size_of_tile).rem_euclid(16.0) as usize;
+            // edge cases (next_down not stabilized in rust)
+            if (x1 - render_rect.max.x) < 0.1 {
+                x1 -= 0.1
+            }
+            if (y1 - render_rect.max.y) < 0.1 {
+                y1 -= 0.1
+            }
+            let x1 = (x1 / size_of_tile).rem_euclid(16.0) as usize;
+            let y1 = (y1 / size_of_tile).rem_euclid(16.0) as usize;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let tile_index = (x + y * 16) as u8;
+                    tile_indices.push(tile_index)
+                }
+            }
+
+            brush_width = (x1 + 1) - x0;
+            brush_height = (y1 + 1) - y0;
+        }
+
+        (tile_indices, brush_width, brush_height)
     }
 
     fn tile_picker_rect(available_rect: &egui::Rect) -> egui::Rect {
@@ -225,39 +302,8 @@ impl TileBrush {
                     );
                     let render_rect = Self::tile_picker_rect(available_rect);
 
-                    let mut tile_indices: Vec<u8> = Default::default();
-                    let mut brush_width = 0;
-                    let mut brush_height = 0;
-                    // handle pointer position inside the available rect
-                    if pointer_rect.intersects(render_rect) {
-                        // determine tile
-                        let size_of_tile = render_rect.width() / 16.0;
-                        let x0 = pointer_rect.min.x.max(render_rect.min.x) - render_rect.min.x;
-                        let y0 = pointer_rect.min.y.max(render_rect.min.y) - render_rect.min.y;
-                        let mut x1 = pointer_rect.max.x.min(render_rect.max.x) - render_rect.min.x;
-                        let mut y1 = pointer_rect.max.y.min(render_rect.max.y) - render_rect.min.y;
-
-                        let x0 = (x0 / size_of_tile).rem_euclid(16.0) as usize;
-                        let y0 = (y0 / size_of_tile).rem_euclid(16.0) as usize;
-                        // edge cases (next_down not stabilized in rust)
-                        if (x1 - render_rect.max.x) < 0.1 {
-                            x1 -= 0.1
-                        }
-                        if (y1 - render_rect.max.y) < 0.1 {
-                            y1 -= 0.1
-                        }
-                        let x1 = (x1 / size_of_tile).rem_euclid(16.0) as usize;
-                        let y1 = (y1 / size_of_tile).rem_euclid(16.0) as usize;
-                        for y in y0..=y1 {
-                            for x in x0..=x1 {
-                                let tile_index = (x + y * 16) as u8;
-                                tile_indices.push(tile_index)
-                            }
-                        }
-
-                        brush_width = (x1 + 1) - x0;
-                        brush_height = (y1 + 1) - y0;
-                    }
+                    let (tile_indices, brush_width, brush_height) =
+                        Self::selected_tiles_picker(pointer_rect, render_rect);
 
                     if !tile_indices.is_empty() {
                         let physics_group_editor = &map.groups.physics.user;
@@ -299,7 +345,7 @@ impl TileBrush {
                                             })
                                             .collect(),
                                     ),
-                                    EditorPhysicsLayer::Speedup(_) => {
+                                    EditorPhysicsLayer::Speedup(layer) => {
                                         MapTileLayerPhysicsTiles::Speedup(
                                             tile_indices
                                                 .into_iter()
@@ -308,12 +354,14 @@ impl TileBrush {
                                                         index,
                                                         flags: TileFlags::empty(),
                                                     },
-                                                    ..Default::default()
+                                                    angle: layer.user.speedup_angle,
+                                                    force: layer.user.speedup_force,
+                                                    max_speed: layer.user.speedup_max_speed,
                                                 })
                                                 .collect(),
                                         )
                                     }
-                                    EditorPhysicsLayer::Switch(_) => {
+                                    EditorPhysicsLayer::Switch(layer) => {
                                         MapTileLayerPhysicsTiles::Switch(
                                             tile_indices
                                                 .into_iter()
@@ -323,7 +371,7 @@ impl TileBrush {
                                                         flags: TileFlags::empty(),
                                                     },
                                                     number: physics_group_editor.active_switch,
-                                                    ..Default::default()
+                                                    delay: layer.user.switch_delay,
                                                 })
                                                 .collect(),
                                         )
@@ -341,11 +389,20 @@ impl TileBrush {
                                             .collect(),
                                     ),
                                 }),
-                                entities_container
-                                    .get_or_default::<ContainerKey>(&"default".try_into().unwrap())
-                                    // TODO:
-                                    .get_or_default("ddnet")
-                                    .clone(),
+                                {
+                                    let physics = entities_container
+                                        .get_or_default::<ContainerKey>(
+                                            &"default".try_into().unwrap(),
+                                        );
+                                    if matches!(layer, EditorPhysicsLayer::Speedup(_)) {
+                                        physics.speedup.clone()
+                                    } else {
+                                        physics
+                                            // TODO:
+                                            .get_or_default("ddnet")
+                                            .clone()
+                                    }
+                                },
                             ),
                             EditorLayerUnionRef::Design { layer, .. } => {
                                 let EditorLayer::Tile(layer) = layer else {
@@ -408,6 +465,7 @@ impl TileBrush {
                             }),
                         };
 
+                        self.brush_id_counter += 1;
                         self.brush = Some(TileBrushTiles {
                             tiles,
                             w,
@@ -417,6 +475,8 @@ impl TileBrush {
                             render,
                             map_render: MapGraphics::new(backend_handle),
                             texture,
+
+                            last_apply: Default::default(),
                         });
                     }
                 }
@@ -538,11 +598,20 @@ impl TileBrush {
                                         ))
                                     }
                                 }),
-                                entities_container
-                                    .get_or_default::<ContainerKey>(&"default".try_into().unwrap())
-                                    // TODO:
-                                    .get_or_default("ddnet")
-                                    .clone(),
+                                {
+                                    let physics = entities_container
+                                        .get_or_default::<ContainerKey>(
+                                            &"default".try_into().unwrap(),
+                                        );
+                                    if matches!(layer, EditorPhysicsLayer::Speedup(_)) {
+                                        physics.speedup.clone()
+                                    } else {
+                                        physics
+                                            // TODO:
+                                            .get_or_default("ddnet")
+                                            .clone()
+                                    }
+                                },
                             ),
                             EditorLayerUnionRef::Design { layer, .. } => {
                                 let EditorLayer::Tile(layer) = layer else {
@@ -584,6 +653,7 @@ impl TileBrush {
                             &tiles,
                         );
 
+                        self.brush_id_counter += 1;
                         self.brush = Some(TileBrushTiles {
                             tiles,
                             w,
@@ -599,6 +669,8 @@ impl TileBrush {
                             render,
                             map_render: MapGraphics::new(backend_handle),
                             texture,
+
+                            last_apply: Default::default(),
                         });
                     } else {
                         self.brush = None;
@@ -634,6 +706,7 @@ impl TileBrush {
     }
 
     fn apply_brush_internal(
+        brush_id_counter: u128,
         layer: &EditorLayerUnionRef<'_>,
         brush: &TileBrushTiles,
         client: &mut EditorClient,
@@ -708,8 +781,9 @@ impl TileBrush {
                 matches!(brush.tiles, MapTileLayerTiles::Design(_))
             }
         };
+
         if brush_w > 0 && brush_h > 0 && brush_matches_layer {
-            let (action, group_indentifier) = match layer {
+            let (action, group_indentifier, apply_layer) = match layer {
                 EditorLayerUnionRef::Physics {
                     layer,
                     group_attr,
@@ -859,7 +933,10 @@ impl TileBrush {
                             h: NonZeroU16MinusOne::new(brush_h).unwrap(),
                         },
                     }),
-                    format!("tile-brush phy {}", layer_index),
+                    format!("tile-brush phy {}", layer_index,),
+                    TileBrushLastApplyLayer::Physics {
+                        layer_index: *layer_index,
+                    },
                 ),
                 EditorLayerUnionRef::Design {
                     layer,
@@ -934,10 +1011,30 @@ impl TileBrush {
                             "tile-brush {}-{}-{}",
                             group_index, layer_index, is_background
                         ),
+                        TileBrushLastApplyLayer::Design {
+                            group_index: *group_index,
+                            layer_index: *layer_index,
+                            is_background: *is_background,
+                        },
                     )
                 }
             };
-            client.execute(action, Some(&group_indentifier));
+
+            let next_apply = TileBrushLastApply {
+                x,
+                y,
+                w: brush_w,
+                h: brush_h,
+                layer: apply_layer,
+            };
+            let apply = brush.last_apply.get().is_none_or(|b| b != next_apply);
+            if apply {
+                brush.last_apply.set(Some(next_apply));
+                client.execute(
+                    action,
+                    Some(&format!("{group_indentifier}-{brush_id_counter}")),
+                );
+            }
         }
     }
 
@@ -972,6 +1069,7 @@ impl TileBrush {
                         let brush_w = (brush.w.get() - tile_offset_x).min(width);
 
                         Self::apply_brush_internal(
+                            self.brush_id_counter,
                             &layer,
                             brush,
                             client,
@@ -1117,6 +1215,7 @@ impl TileBrush {
                 let y = y - brush.negative_offset.y as i32;
 
                 Self::apply_brush_internal(
+                    self.brush_id_counter,
                     &layer,
                     brush,
                     client,
@@ -1560,33 +1659,26 @@ impl TileBrush {
             let tl_y = -render_rect.min.y * size_ratio_y;
 
             // render filled rect as bg
-            state.map_canvas(
-                0.0,
-                0.0,
-                canvas_handle.canvas_width(),
-                canvas_handle.canvas_height(),
-            );
-            render_filled_rect_from_state(
-                stream_handle,
-                render_rect,
-                ubvec4::new(0, 0, 0, 255),
-                state,
-                false,
-            );
+            state.map_canvas(0.0, 0.0, ui_canvas.width(), ui_canvas.height());
+            render_checkerboard_background(stream_handle, render_rect, &state);
 
             state.map_canvas(
                 tl_x,
                 tl_y,
-                tl_x + canvas_handle.canvas_width() * size_ratio_x,
-                tl_y + canvas_handle.canvas_height() * size_ratio_y,
+                tl_x + ui_canvas.width() * size_ratio_x,
+                tl_y + ui_canvas.height() * size_ratio_y,
             );
             let texture = match layer.as_ref().unwrap() {
-                EditorLayerUnionRef::Physics { .. } => {
-                    entities_container
-                        .get_or_default::<ContainerKey>(&"default".try_into().unwrap())
-                        // TODO:
-                        .get_or_default("ddnet")
-                }
+                EditorLayerUnionRef::Physics { layer, .. } => match layer {
+                    EditorPhysicsLayer::Arbitrary(_) | EditorPhysicsLayer::Game(_) => {
+                        &self.tile_picker.physics_overlay.game
+                    }
+                    EditorPhysicsLayer::Front(_) => &self.tile_picker.physics_overlay.front,
+                    EditorPhysicsLayer::Tele(_) => &self.tile_picker.physics_overlay.tele,
+                    EditorPhysicsLayer::Speedup(_) => &self.tile_picker.physics_overlay.speedup,
+                    EditorPhysicsLayer::Switch(_) => &self.tile_picker.physics_overlay.switch,
+                    EditorPhysicsLayer::Tune(_) => &self.tile_picker.physics_overlay.tune,
+                },
                 EditorLayerUnionRef::Design { layer, .. } => match layer {
                     EditorLayer::Tile(layer) => layer
                         .layer
@@ -1632,12 +1724,7 @@ impl TileBrush {
                 );
             }
             // render rect border
-            state.map_canvas(
-                0.0,
-                0.0,
-                canvas_handle.canvas_width(),
-                canvas_handle.canvas_height(),
-            );
+            state.map_canvas(0.0, 0.0, ui_canvas.width(), ui_canvas.height());
 
             render_rect_from_state(
                 stream_handle,
@@ -1647,6 +1734,32 @@ impl TileBrush {
             );
 
             if let Some(TileBrushDownPos { ui, .. }) = &self.pointer_down_world_pos {
+                let pointer_down = pos2(ui.x, ui.y);
+                let pointer_rect = egui::Rect::from_min_max(
+                    current_pointer_pos.min(pointer_down),
+                    current_pointer_pos.max(pointer_down),
+                );
+                let (tile_indices, brush_width, brush_height) =
+                    Self::selected_tiles_picker(pointer_rect, render_rect);
+                if let Some(&index) = tile_indices.first() {
+                    let tile_size = render_rect.width() / 16.0;
+                    let min = render_rect.min
+                        + egui::vec2((index % 16) as f32, (index / 16) as f32) * tile_size;
+                    render_filled_rect_from_state(
+                        stream_handle,
+                        egui::Rect::from_min_max(
+                            min,
+                            min + egui::vec2(
+                                brush_width as f32 * tile_size,
+                                brush_height as f32 * tile_size,
+                            ),
+                        ),
+                        ubvec4::new(0, 255, 255, 50),
+                        state,
+                        false,
+                    );
+                }
+
                 render_rect_from_state(
                     stream_handle,
                     state,

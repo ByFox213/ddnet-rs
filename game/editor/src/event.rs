@@ -6,8 +6,10 @@ use std::{
 
 use async_trait::async_trait;
 use base::hash::Hash;
+use math::math::vector::vec2;
 use network::network::{
-    connection::NetworkConnectionId, event::NetworkEvent,
+    connection::{ConnectionStats, NetworkConnectionId},
+    event::NetworkEvent,
     event_generator::NetworkEventToGameEventGenerator,
 };
 use serde::{Deserialize, Serialize};
@@ -18,34 +20,118 @@ use crate::actions::actions::EditorActionGroup;
 /// An editor command is the way the user expresses to
 /// issue a certain state change.
 ///
-/// E.g. a undo command means that the server should try to
+/// E.g. an undo command means that the server should try to
 /// undo the last action.
 /// It's basically the logic of the editor ui which does not diretly affect
 /// the state of the map.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum EditorCommand {
     Undo,
     Redo,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorEventOverwriteMap {
     pub map: Vec<u8>,
     pub resources: HashMap<Hash, Vec<u8>>,
 }
 
+/// The client props the server knows about.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ClientProps {
+    pub mapper_name: String,
+    pub color: [u8; 3],
+
+    /// Cursor position in the world coordinates
+    pub cursor_world: vec2,
+
+    /// unique id on the server
+    pub server_id: u64,
+
+    pub stats: Option<ConnectionStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfigState {
+    pub auto_save: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminChangeConfig {
+    pub password: String,
+    pub state: AdminConfigState,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct ActionDbg {
+    pub num_actions: usize,
+
+    pub action_shuffle_probability: u8,
+    pub undo_redo_probability: u8,
+    pub invalid_action_probability: u8,
+    pub full_map_validation_probability: u8,
+    pub no_actions_identifier: bool,
+}
+
 /// editor events are a collection of either actions or commands
-#[derive(Debug, Serialize, Deserialize)]
-pub enum EditorEvent {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EditorEventClientToServer {
     Action(EditorActionGroup),
-    Command(EditorCommand),
-    Error(String),
     Auth {
         password: String,
         // if not local user
         is_local_client: bool,
+        mapper_name: String,
+        color: [u8; 3],
     },
+    Command(EditorCommand),
+    Info(ClientProps),
+    Chat {
+        msg: String,
+    },
+    AdminAuth {
+        password: String,
+    },
+    AdminChangeConfig(AdminChangeConfig),
+    DbgAction(ActionDbg),
+}
+
+/// editor events are a collection of either actions or commands
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EditorEventServerToClient {
+    RedoAction {
+        action: EditorActionGroup,
+        redo_label: Option<String>,
+        undo_label: Option<String>,
+    },
+    UndoAction {
+        action: EditorActionGroup,
+        redo_label: Option<String>,
+        undo_label: Option<String>,
+    },
+    Error(String),
     Map(EditorEventOverwriteMap),
+    Infos(Vec<ClientProps>),
+    Info {
+        server_id: u64,
+        /// Allows remotely controlled administration (e.g. changing config)
+        allows_remote_admin: bool,
+    },
+    Chat {
+        from: String,
+        msg: String,
+    },
+    AdminAuthed,
+    AdminState {
+        cur_state: AdminConfigState,
+    },
+}
+
+/// editor events are a collection of either actions or commands
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EditorEvent {
+    Client(EditorEventClientToServer),
+    Server(EditorEventServerToClient),
 }
 
 pub enum EditorNetEvent {
@@ -69,6 +155,10 @@ impl EditorEventGenerator {
     pub fn take(&self) -> VecDeque<(NetworkConnectionId, Duration, EditorNetEvent)> {
         std::mem::take(&mut self.events.blocking_lock())
     }
+
+    pub fn push(&self, event: (NetworkConnectionId, Duration, EditorNetEvent)) {
+        self.events.blocking_lock().push_back(event);
+    }
 }
 
 #[async_trait]
@@ -81,7 +171,7 @@ impl NetworkEventToGameEventGenerator for EditorEventGenerator {
     ) {
         let msg = bincode::serde::decode_from_slice::<EditorEvent, _>(
             bytes,
-            bincode::config::standard().with_limit::<{ 1024 * 1024 * 4 }>(),
+            bincode::config::standard().with_limit::<{ 1024 * 1024 * 1024 }>(),
         );
         if let Ok((msg, _)) = msg {
             self.events

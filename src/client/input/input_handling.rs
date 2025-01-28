@@ -191,7 +191,7 @@ impl InputHandling {
             }
         }
         self.last_known_cursor = Some(platform_output.cursor_icon);
-        native.toggle_cursor(!matches!(platform_output.cursor_icon, CursorIcon::None));
+        native.relative_mouse(matches!(platform_output.cursor_icon, CursorIcon::None));
         self.state
             .handle_platform_output(native.borrow_window(), platform_output);
     }
@@ -242,9 +242,9 @@ impl InputHandling {
                         BindActionsCharacter::Jump => character.jump = true,
                         BindActionsCharacter::Fire => character.fire = true,
                         BindActionsCharacter::Hook => character.hook = true,
-                        BindActionsCharacter::NextWeapon => character.weapon_diff += 1,
-                        BindActionsCharacter::PrevWeapon => character.weapon_diff -= 1,
-                        BindActionsCharacter::Weapon(_) => {
+                        BindActionsCharacter::NextWeapon
+                        | BindActionsCharacter::PrevWeapon
+                        | BindActionsCharacter::Weapon(_) => {
                             // only listen for press
                         }
                     }
@@ -334,6 +334,12 @@ impl InputHandling {
                     BindActionsLocalPlayer::Character(BindActionsCharacter::Weapon(weapon)) => {
                         character.next_weapon = Some(*weapon);
                     }
+                    BindActionsLocalPlayer::Character(BindActionsCharacter::NextWeapon) => {
+                        character.weapon_diff += 1;
+                    }
+                    BindActionsLocalPlayer::Character(BindActionsCharacter::PrevWeapon) => {
+                        character.weapon_diff -= 1;
+                    }
                     BindActionsLocalPlayer::Dummy(BindActionsCharacter::Weapon(weapon)) => {
                         dummy.next_weapon = Some(*weapon);
                     }
@@ -373,16 +379,14 @@ impl InputHandling {
                     BindAction::TriggerCommand(cmd) => {
                         if let Some(action) = bind_cmds.get(cmd.ident.as_str()) {
                             handle_action(action);
-                        } else {
-                            let mut msgs = Default::default();
-                            run_command(
-                                CommandTypeRef::Full(cmd),
-                                entries,
-                                config_engine,
-                                config_game,
-                                &mut msgs,
-                                true,
-                            );
+                        } else if let Err(err) = run_command(
+                            CommandTypeRef::Full(cmd),
+                            entries,
+                            config_engine,
+                            config_game,
+                            true,
+                        ) {
+                            log::debug!("{err}");
                         }
                     }
                 }
@@ -433,16 +437,14 @@ impl InputHandling {
                     BindAction::Command(cmd) | BindAction::TriggerCommand(cmd) => {
                         if let Some(action) = bind_cmds.get(cmd.ident.as_str()) {
                             handle_action(action);
-                        } else {
-                            let mut msgs = Default::default();
-                            run_command(
-                                CommandTypeRef::Full(cmd),
-                                entries,
-                                config_engine,
-                                config_game,
-                                &mut msgs,
-                                true,
-                            );
+                        } else if let Err(err) = run_command(
+                            CommandTypeRef::Full(cmd),
+                            entries,
+                            config_engine,
+                            config_game,
+                            true,
+                        ) {
+                            log::debug!("{err}");
                         }
                     }
                 }
@@ -715,7 +717,7 @@ impl InputHandling {
         }
     }
 
-    /// returns a list of immediate events that are a result of a input
+    /// returns a list of immediate events that are a result of an input
     pub fn handle_player_binds(
         &mut self,
         game_data: &mut GameData,

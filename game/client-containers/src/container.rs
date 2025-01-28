@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tar::EntryType;
 use tokio::sync::Semaphore;
 
 use anyhow::anyhow;
@@ -21,7 +22,7 @@ use either::Either;
 use game_interface::types::resource_key::ResourceKey;
 use graphics::{
     graphics::graphics::Graphics, graphics_mt::GraphicsMultiThreaded,
-    handles::texture::texture::GraphicsTextureHandle, image::texture_2d_to_3d,
+    handles::texture::texture::GraphicsTextureHandle,
 };
 use graphics_types::{
     commands::TexFlags,
@@ -29,7 +30,10 @@ use graphics_types::{
 };
 use hashlink::LinkedHashMap;
 use hiarc::Hiarc;
-use image::png::{is_png_image_valid, load_png_image, PngResultPersistent};
+use image_utils::{
+    png::{is_png_image_valid, load_png_image_as_rgba, PngResultPersistent, PngValidatorOptions},
+    utils::texture_2d_to_3d,
+};
 use log::info;
 use sound::{
     ogg_vorbis::verify_ogg_vorbis, scene_object::SceneObject, sound::SoundManager,
@@ -130,7 +134,7 @@ struct DefaultItem<L> {
 ///
 /// # Users
 /// Users of the containers must call [Container::get_or_default] to get
-/// access to a resource. It accepts a file name and a optional hash.
+/// access to a resource. It accepts a file name and an optional hash.
 /// The hash must be used if the resource is forced by a game server,
 /// else it's optional.
 /// Calling [Container::update] causes the container to remove unused
@@ -415,10 +419,20 @@ where
     }
 
     /// Verifies a resource, prints warnings on error
-    fn verify_resource(file_ty: &str, file_name: &str, file: &[u8]) -> bool {
+    fn verify_resource(file_ty: &str, file_name: &str, file: &[u8], allow_hq_assets: bool) -> bool {
         match file_ty {
             "png" => {
-                if let Err(err) = is_png_image_valid(file, Default::default()) {
+                if let Err(err) = is_png_image_valid(
+                    file,
+                    if allow_hq_assets {
+                        PngValidatorOptions {
+                            max_width: 4096.try_into().unwrap(),
+                            max_height: 4096.try_into().unwrap(),
+                        }
+                    } else {
+                        Default::default()
+                    },
+                ) {
                     log::warn!(
                         "downloaded image resource (png) {}\
                         is not a valid png file: {}",
@@ -446,7 +460,7 @@ where
                         // also check if only allowed characters are inside the strings
                         {
                             for char in line.chars() {
-                                if !char.is_ascii_graphic() || !char.is_ascii_whitespace() {
+                                if !char.is_ascii_graphic() && !char.is_ascii_whitespace() {
                                     log::warn!(
                                         "downloaded text resource (txt) \
                                         ({}) contains an unallowed character: \"{}\"",
@@ -471,9 +485,10 @@ where
             }
             _ => {
                 log::warn!(
-                    "Unsupported resource type {} \
+                    "Unsupported resource type {} for {} \
                     could not be validated",
-                    file_ty
+                    file_ty,
+                    file_name,
                 );
                 return false;
             }
@@ -523,19 +538,42 @@ where
         game_server_http: Option<Url>,
         resource_http_download: HttpIndexAndUrl,
     ) -> anyhow::Result<ContainerLoadedItem> {
+        let allow_hq_assets = false;
+
         let read_tar = |file: &[u8]| {
             let mut file = tar::Archive::new(std::io::Cursor::new(file));
             match file.entries() {
                 Ok(entries) => entries
-                    .map(|entry| {
+                    .filter_map(|entry| {
                         entry
-                            .map(|mut entry| {
-                                let path = entry.path().map(|path| path.to_path_buf())?;
-                                let mut file: Vec<_> = Default::default();
-                                entry.read_to_end(&mut file).map(|_| (path, file))
-                            })
                             .map_err(|err| anyhow::anyhow!(err))
-                            .and_then(|val| anyhow::Ok(val?))
+                            .map(|mut entry| {
+                                let ty = entry.header().entry_type();
+                                if let EntryType::Regular = ty {
+                                    Some(
+                                        entry
+                                            .path()
+                                            .map(|path| path.to_path_buf())
+                                            .map_err(|err| anyhow::anyhow!(err))
+                                            .and_then(|path| {
+                                                let mut file: Vec<_> = Default::default();
+
+                                                entry
+                                                    .read_to_end(&mut file)
+                                                    .map(|_| (path, file))
+                                                    .map_err(|err| anyhow::anyhow!(err))
+                                            }),
+                                    )
+                                } else if matches!(ty, EntryType::Directory) {
+                                    None
+                                } else {
+                                    Some(Err(anyhow!(
+                                        "The tar reader expects files & dictionaries only"
+                                    )))
+                                }
+                            })
+                            .transpose()
+                            .map(|r| r.and_then(|r| r))
                     })
                     .collect::<anyhow::Result<HashMap<_, _>>>(),
                 Err(err) => Err(anyhow::anyhow!(err)),
@@ -637,6 +675,7 @@ where
                                     name.extension().and_then(|s| s.to_str()).unwrap_or(""),
                                     name.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
                                     file,
+                                    allow_hq_assets,
                                 ) {
                                     verified = false;
                                     break;
@@ -663,7 +702,7 @@ where
                 }) {
                     let _g = http_download_tasks.acquire().await?;
                     if let Ok(file) = http.download_binary(game_server_http, &hash).await {
-                        if Self::verify_resource("png", &name, &file) {
+                        if Self::verify_resource("png", &name, &file, allow_hq_assets) {
                             save_to_disk(&name, &file).await;
                             files = Some(ContainerLoadedItem::SingleFile(file.to_vec()));
                         }
@@ -799,6 +838,7 @@ where
                                             name.extension().and_then(|s| s.to_str()).unwrap_or(""),
                                             name.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
                                             file,
+                                            allow_hq_assets,
                                         ) {
                                             verified = false;
                                             break;
@@ -816,7 +856,7 @@ where
                                     false
                                 }
                             } else if ty == "png" {
-                                if Self::verify_resource("png", &name, &file) {
+                                if Self::verify_resource("png", &name, &file, allow_hq_assets) {
                                     files = Some(ContainerLoadedItem::SingleFile(file.to_vec()));
                                     true
                                 } else {
@@ -1062,6 +1102,26 @@ where
             self.resource_server_download_url = url;
 
             self.clear_except_default();
+        }
+    }
+
+    /// Returns `true` if the resource was loaded or failed to load (and will not be loaded),
+    /// `false` otherwise.
+    ///
+    /// This call is non-blocking.
+    pub fn is_loaded_or_failed<Q>(&mut self, name: &Q) -> bool
+    where
+        Q: Borrow<ContainerKey>,
+    {
+        self.failed_tasks.contains(name.borrow()) || {
+            let item_res = self.items.get(name.borrow());
+            if item_res.is_none() {
+                // try to load the resource
+                self.get_or_default(name);
+                false
+            } else {
+                true
+            }
         }
     }
 
@@ -1352,7 +1412,7 @@ pub fn load_file_part_as_png_ex(
         allow_default,
     )?;
     let mut img_data = Vec::<u8>::new();
-    let part_img = load_png_image(file.data, |width, height, bytes_per_pixel| {
+    let part_img = load_png_image_as_rgba(file.data, |width, height, bytes_per_pixel| {
         img_data = vec![0; width * height * bytes_per_pixel];
         &mut img_data
     })?;
@@ -1423,6 +1483,45 @@ pub fn load_file_part_and_upload_ex(
         },
         from_default: part_img.from_default,
     })
+}
+
+pub fn load_file_part_list_and_upload(
+    graphics_mt: &GraphicsMultiThreaded,
+    files: &ContainerLoadedItemDir,
+    default_files: &ContainerLoadedItemDir,
+    item_name: &str,
+    extra_paths: &[&str],
+    part_name_base: &str,
+) -> anyhow::Result<Vec<ContainerItemLoadData>> {
+    let mut textures = Vec::new();
+    let mut i = 0;
+    let mut allow_default = true;
+    loop {
+        match load_file_part_and_upload_ex(
+            graphics_mt,
+            files,
+            default_files,
+            item_name,
+            extra_paths,
+            &format!("{part_name_base}_{:03}", i + 1),
+            allow_default,
+        ) {
+            Ok(img) => {
+                allow_default &= img.from_default;
+                textures.push(img.img);
+            }
+            Err(err) => {
+                if i == 0 {
+                    return Err(err);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        i += 1;
+    }
+    Ok(textures)
 }
 
 pub struct SoundFilePartResult {
@@ -1510,6 +1609,44 @@ pub fn load_sound_file_part_and_upload_ex(
     Ok(SoundFilePartResult { mem, from_default })
 }
 
+pub fn load_sound_file_part_list_and_upload(
+    sound_mt: &SoundMultiThreaded,
+    files: &ContainerLoadedItemDir,
+    default_files: &ContainerLoadedItemDir,
+    item_name: &str,
+    extra_paths: &[&str],
+    part_name_base: &str,
+) -> anyhow::Result<Vec<SoundBackendMemory>> {
+    let mut sounds = Vec::new();
+    let mut i = 0;
+    let mut allow_default = true;
+    loop {
+        match load_sound_file_part_and_upload_ex(
+            sound_mt,
+            files,
+            default_files,
+            item_name,
+            extra_paths,
+            &format!("{part_name_base}_{:03}", i + 1),
+            allow_default,
+        ) {
+            Ok(sound) => {
+                allow_default &= sound.from_default;
+                sounds.push(sound.mem);
+            }
+            Err(err) => {
+                if i == 0 {
+                    return Err(err);
+                } else {
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(sounds)
+}
+
 /// returns the png data, the width and height are the 3d texture w & h, additionally the depth is returned
 pub fn load_file_part_as_png_and_convert_3d(
     runtime_thread_pool: &Arc<rayon::ThreadPool>,
@@ -1528,7 +1665,7 @@ pub fn load_file_part_as_png_and_convert_3d(
         true,
     )?;
     let mut img_data = Vec::<u8>::new();
-    let part_img = load_png_image(file.data, |width, height, bytes_per_pixel| {
+    let part_img = load_png_image_as_rgba(file.data, |width, height, bytes_per_pixel| {
         img_data = vec![0; width * height * bytes_per_pixel];
         &mut img_data
     })?;

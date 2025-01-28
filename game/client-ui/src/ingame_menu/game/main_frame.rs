@@ -82,7 +82,7 @@ pub fn render(ui: &mut egui::Ui, ui_state: &mut UiState, pipe: &mut UiRenderPipe
                                         });
                                 }
                                 if ui.button("Join other team").clicked() {
-                                    // Show a overview over all teams
+                                    // Show an overview over all teams
                                     config
                                         .path()
                                         .add_query(("team_select".to_string(), "1".to_string()));
@@ -296,11 +296,13 @@ pub fn render(ui: &mut egui::Ui, ui_state: &mut UiState, pipe: &mut UiRenderPipe
                                             ui.label("Sceen width:");
                                             ui.add(
                                                 DragValue::new(&mut dummy.screen_width)
+                                                    .update_while_editing(false)
                                                     .range(1..=100),
                                             );
                                             ui.label("Sceen height:");
                                             ui.add(
                                                 DragValue::new(&mut dummy.screen_height)
+                                                    .update_while_editing(false)
                                                     .range(1..=100),
                                             );
 

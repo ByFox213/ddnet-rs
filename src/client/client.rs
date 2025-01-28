@@ -1,8 +1,9 @@
 use std::{
-    borrow::Borrow, cell::RefCell, net::SocketAddr, num::NonZeroUsize, rc::Rc, sync::Arc,
-    time::Duration,
+    borrow::Borrow, cell::RefCell, net::SocketAddr, num::NonZeroUsize, path::PathBuf, rc::Rc,
+    sync::Arc, time::Duration,
 };
 
+use anyhow::anyhow;
 use base::{
     benchmark::Benchmark,
     linked_hash_map_view::FxLinkedHashMap,
@@ -13,10 +14,10 @@ use base_fs::filesys::FileSystem;
 
 use base_http::http::HttpClient;
 use base_io::io::{Io, IoFileSys};
-use binds::binds::BindActionsHotkey;
+use binds::binds::{BindActionsHotkey, BindActionsLocalPlayer};
 use client_accounts::accounts::{Accounts, AccountsLoading};
 use client_console::console::{
-    console::ConsoleRenderPipe,
+    console::{ConsoleEvents, ConsoleRenderPipe},
     local_console::{LocalConsole, LocalConsoleBuilder, LocalConsoleEvent},
     remote_console::RemoteConsoleEvent,
 };
@@ -40,12 +41,14 @@ use client_render_game::render_game::{
     RenderGameCreateOptions, RenderGameForPlayer, RenderGameInput, RenderGameInterface,
     RenderGameSettings, RenderModTy, RenderPlayerCameraMode,
 };
+use client_types::console::{entries_to_parser, ConsoleEntry};
 use client_ui::{
     chat::user_data::{ChatEvent, ChatMode},
     connect::{
         page::ConnectingUi,
         user_data::{ConnectMode, ConnectModes},
     },
+    console::utils::run_commands,
     events::{UiEvent, UiEvents},
     ingame_menu::{
         account_info::AccountInfo,
@@ -66,6 +69,7 @@ use client_ui::{
     spectator_selection::user_data::SpectatorSelectionEvent,
     utils::render_tee_for_ui,
 };
+use command_parser::parser::ParserCache;
 use config::config::{ConfigEngine, ConfigMonitor};
 use demo::recorder::DemoRecorder;
 use editor::editor::{EditorInterface, EditorResult};
@@ -79,7 +83,7 @@ use graphics_backend::{
     window::BackendWindow,
 };
 
-use editor_wasm::editor::editor_wasm_manager::EditorWasmManager;
+use editor_wasm::editor::editor_wasm_manager::{EditorState, EditorWasmManager};
 use game_interface::{
     client_commands::{ClientCameraMode, ClientCommand, JoinStage},
     events::EventClientInfo,
@@ -179,12 +183,80 @@ pub fn ddnet_main(
         )
     });
 
-    let config_engine = config_fs::load(&io).unwrap_or_default();
+    let mut config_engine = config_fs::load(&io).unwrap_or_default();
 
     let benchmark = Benchmark::new(config_engine.dbg.bench);
 
-    let config_game = game_config_fs::fs::load(&io).unwrap_or_default();
+    let mut config_game = game_config_fs::fs::load(&io).unwrap_or_default();
     benchmark.bench("loading client config");
+
+    let mut has_startup_errors = false;
+    let local_console_builder = if !start_arguments.is_empty() {
+        let local_console_builder = LocalConsoleBuilder::default();
+        let parser_entries = entries_to_parser(&local_console_builder.entries);
+        for line in start_arguments.iter().filter(|l| !l.is_empty()) {
+            let cmds = command_parser::parser::parse(
+                line,
+                &parser_entries,
+                &local_console_builder.parser_cache,
+            );
+            let mut res = String::default();
+            let cur_cmds_succeeded = run_commands(
+                &cmds,
+                &local_console_builder.entries,
+                &mut config_engine,
+                &mut config_game,
+                &mut res,
+                true,
+            );
+            log::debug!("{}", res);
+            if !cur_cmds_succeeded {
+                log::error!("{}", res);
+            }
+            let mut has_events = true;
+            let mut count = 0;
+            while has_events {
+                has_events = false;
+                let events = local_console_builder.console_events.take();
+                for ev in events {
+                    if let LocalConsoleEvent::Exec { file_path } = &ev {
+                        ClientNativeImpl::handle_exec(
+                            &io,
+                            file_path.clone(),
+                            &mut config_engine,
+                            &mut config_game,
+                            &local_console_builder.entries,
+                            &local_console_builder.parser_cache,
+                            |err| {
+                                log::error!("{}", err);
+                                has_startup_errors = true;
+                            },
+                            |msg| {
+                                log::info!("{}", msg);
+                            },
+                        );
+
+                        has_events = true;
+                    } else {
+                        local_console_builder.console_events.push(ev);
+                    }
+                }
+
+                count += 1;
+
+                if count >= 16 {
+                    has_startup_errors = true;
+                    log::error!("Exec recursion count reached 16, which is the upper limit.");
+                    break;
+                }
+            }
+            has_startup_errors |= !cur_cmds_succeeded;
+        }
+        benchmark.bench("parsing start arguments");
+        Some(local_console_builder)
+    } else {
+        None
+    };
 
     let graphics_backend_io_loading = GraphicsBackendIoLoading::new(&config_engine.gfx, &io);
     // first prepare all io tasks of all components
@@ -204,6 +276,8 @@ pub fn ddnet_main(
         config_game,
         graphics_backend_io_loading,
         graphics_backend_loading: None,
+        local_console_builder,
+        has_startup_errors,
     };
     Native::run_loop::<ClientNativeImpl, _>(
         client,
@@ -237,7 +311,7 @@ pub fn ddnet_main(
     Ok(())
 }
 
-#[cfg(feature = "alloc-track")]
+#[cfg(feature = "alloc_track")]
 fn track_report() {
     let total_consumption = std::cell::Cell::new(0);
     let report = alloc_track::backtrace_report(|_, stats| {
@@ -248,6 +322,20 @@ fn track_report() {
     std::fs::write(
         "trace.txt",
         format!("BACKTRACES\n{report}\nTotal:{}", total_consumption.get()),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "alloc_stats")]
+fn stats_report() {
+    let alloc: &stats_alloc::StatsAlloc<std::alloc::System> = &stats_alloc::INSTRUMENTED_SYSTEM;
+    let stats = alloc.stats();
+    let cur_alloc = stats
+        .bytes_allocated
+        .saturating_sub(stats.bytes_deallocated);
+    std::fs::write(
+        "trace.txt",
+        format!("Stats:\n{:?}\nCur usage:{}", stats, cur_alloc),
     )
     .unwrap();
 }
@@ -275,6 +363,9 @@ struct ClientNativeLoadingImpl {
     config_game: ConfigGame,
     graphics_backend_io_loading: GraphicsBackendIoLoading,
     graphics_backend_loading: Option<GraphicsBackendLoading>,
+
+    local_console_builder: Option<LocalConsoleBuilder>,
+    has_startup_errors: bool,
 }
 
 struct ClientNativeImpl {
@@ -303,7 +394,7 @@ struct ClientNativeImpl {
     cur_time: Duration,
     last_refresh_rate_time: Duration,
 
-    editor: Option<EditorWasmManager>,
+    editor: EditorState,
 
     entities_container: EntitiesContainer,
     skin_container: SkinContainer,
@@ -496,6 +587,7 @@ impl ClientNativeImpl {
     }
 
     fn render_game(&mut self, native: &mut dyn NativeImpl) {
+        let remote_console_open = self.game.remote_console_open();
         if let Game::Active(game) = &mut self.game {
             // prepare input
             let events = std::mem::replace(&mut game.events, game.events_pool.new());
@@ -505,7 +597,11 @@ impl ClientNativeImpl {
                 game: game_state,
                 unpredicted_game,
             } = &mut game.map;
-            let is_menu_open = self.ui_manager.ui.ui_state.is_ui_open;
+            let is_menu_open = self.ui_manager.ui.ui_state.is_ui_open
+                || self.local_console.ui.ui_state.is_ui_open
+                || remote_console_open
+                || self.editor.is_open()
+                || self.demo_player.is_some();
 
             let intra_tick_ratio = intra_tick_time_to_ratio(
                 game.game_data.intra_tick_time,
@@ -868,14 +964,16 @@ impl ClientNativeImpl {
                         player_id,
                         RenderGameForPlayer {
                             render_for_player: RenderForPlayer {
-                                chat_info: if let Some(chat_mode) = (!is_menu_open)
-                                    .then_some(client_player.chat_input_active)
-                                    .flatten()
+                                chat_info: if let Some(chat_mode) = client_player.chat_input_active
                                 {
                                     Some((
                                         chat_mode,
                                         std::mem::take(&mut client_player.chat_msg),
-                                        self.inp_manager.clone_inp().egui,
+                                        if is_menu_open {
+                                            Default::default()
+                                        } else {
+                                            self.inp_manager.clone_inp().egui
+                                        },
                                     ))
                                 } else {
                                     None
@@ -993,12 +1091,12 @@ impl ClientNativeImpl {
                     .players
                     .insert(player_id, render_for_player);
             });
-            let dummies = game
+            let inactive_players = game
                 .game_data
                 .local
                 .inactive_local_players()
-                .filter_map(|(&id, player)| player.is_dummy.then_some(id));
-            render_game_input.dummies.extend(dummies);
+                .map(|(id, _)| id);
+            render_game_input.dummies.extend(inactive_players);
 
             // set the dummy's potential cursor position for hammering
             if !render_game_input.dummies.is_empty() {
@@ -1184,23 +1282,24 @@ impl ClientNativeImpl {
 
     fn render(&mut self, native: &mut dyn NativeImpl) {
         // first unload editor => then reload. else native library doesn't get a reload
-        if self
-            .editor
-            .as_ref()
-            .is_some_and(|editor| editor.should_reload())
-        {
-            self.editor = None;
-
-            self.editor = Some(EditorWasmManager::new(
+        if self.editor.should_reload() {
+            let is_open = self.editor.is_open();
+            self.editor = EditorState::None;
+            let editor = EditorWasmManager::new(
                 &self.sound,
                 &self.graphics,
                 &self.graphics_backend,
                 &self.io,
                 &self.thread_pool,
                 &self.font_data,
-            ));
+            );
+            self.editor = if is_open {
+                EditorState::Open(editor)
+            } else {
+                EditorState::Minimized(editor)
+            };
         }
-        if let Some(editor) = &mut self.editor {
+        if let EditorState::Open(editor) = &mut self.editor {
             match editor.render(
                 if self.local_console.ui.ui_state.is_ui_open || self.game.remote_console_open() {
                     Default::default()
@@ -1217,8 +1316,16 @@ impl ClientNativeImpl {
                             || self.game.remote_console_open(),
                     );
                 }
+                EditorResult::Minimize => {
+                    self.editor = match std::mem::take(&mut self.editor) {
+                        EditorState::Open(editor) | EditorState::Minimized(editor) => {
+                            EditorState::Minimized(editor)
+                        }
+                        EditorState::None => EditorState::None,
+                    };
+                }
                 EditorResult::Close => {
-                    self.editor = None;
+                    self.editor = EditorState::None;
                 }
             }
         } else {
@@ -1396,14 +1503,19 @@ impl ClientNativeImpl {
                             }
                         }
                         UiEvent::StartEditor => {
-                            self.editor = Some(EditorWasmManager::new(
-                                &self.sound,
-                                &self.graphics,
-                                &self.graphics_backend,
-                                &self.io,
-                                &self.thread_pool,
-                                &self.font_data,
-                            ));
+                            self.editor = match std::mem::take(&mut self.editor) {
+                                EditorState::Open(editor) | EditorState::Minimized(editor) => {
+                                    EditorState::Open(editor)
+                                }
+                                EditorState::None => EditorState::Open(EditorWasmManager::new(
+                                    &self.sound,
+                                    &self.graphics,
+                                    &self.graphics_backend,
+                                    &self.io,
+                                    &self.thread_pool,
+                                    &self.font_data,
+                                )),
+                            };
                         }
                         UiEvent::Connect {
                             addr,
@@ -1868,20 +1980,20 @@ impl ClientNativeImpl {
         }
 
         // handle the console events
-        self.handle_console_events(native, self.local_console.get_events());
+        self.handle_console_events(native);
         if let Game::Active(game) = &mut self.game {
             let events = game.remote_console.get_events();
             for event in events {
                 match event {
-                    RemoteConsoleEvent::Exec { name, args } => {
+                    RemoteConsoleEvent::Exec { ident_text, args } => {
                         if let Some((player_id, _)) = game.game_data.local.active_local_player() {
-                            if let (Ok(name), Ok(args)) =
-                                (name.as_str().try_into(), args.as_str().try_into())
+                            if let (Ok(ident_text), Ok(args)) =
+                                (ident_text.as_str().try_into(), args.as_str().try_into())
                             {
                                 game.network.send_in_order_to_server(
                                     &ClientToServerMessage::PlayerMsg((
                                         *player_id,
-                                        ClientToServerPlayerMessage::RconExec { name, args },
+                                        ClientToServerPlayerMessage::RconExec { ident_text, args },
                                     )),
                                     NetworkInOrderChannel::Custom(
                                         7302, // reads as "rcon"
@@ -1910,6 +2022,11 @@ impl ClientNativeImpl {
                 })
             } else {
                 None
+            },
+            connection_issues: if let Game::Active(game) = &self.game {
+                game.game_data.is_likely_distconnected(self.cur_time)
+            } else {
+                false
             },
             force_bottom: self.ui_manager.ui.ui_state.is_ui_open,
             show_fps: self.config.game.cl.show_fps,
@@ -1958,10 +2075,74 @@ impl ClientNativeImpl {
         .unwrap();
     }
 
-    fn handle_console_events(
+    fn handle_exec(
+        io: &IoFileSys,
+        file_path: PathBuf,
+        config_engine: &mut ConfigEngine,
+        config_game: &mut ConfigGame,
+
+        entries: &[ConsoleEntry],
+        parser_cache: &ParserCache,
+        mut on_err: impl FnMut(String),
+        mut on_log: impl FnMut(String),
+    ) {
+        let fs = io.fs.clone();
+        let cmds_file = match io
+            .rt
+            .spawn(async move {
+                fs.read_file(&file_path)
+                    .await
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to read config file: {file_path:?} in {:?}: {err}",
+                            fs.get_save_path()
+                        )
+                    })
+                    .and_then(|file| {
+                        String::from_utf8(file).map_err(|err| {
+                            anyhow!(
+                                "failed to read config file: {file_path:?} in {:?}: {err}",
+                                fs.get_save_path()
+                            )
+                        })
+                    })
+            })
+            .get_storage()
+        {
+            Ok(cmds_file) => cmds_file,
+            Err(err) => {
+                on_err(err.to_string());
+                return;
+            }
+        };
+
+        let mut cmds_succeeded = true;
+        let parser_entries = entries_to_parser(entries);
+        for line in cmds_file.lines().filter(|l| !l.is_empty()) {
+            let cmds = command_parser::parser::parse(line, &parser_entries, parser_cache);
+            let mut res = String::default();
+            let cur_cmds_succeeded =
+                run_commands(&cmds, entries, config_engine, config_game, &mut res, true);
+            log::debug!("{}", res);
+            if !cur_cmds_succeeded {
+                on_log(res);
+            }
+            cmds_succeeded &= cur_cmds_succeeded;
+        }
+        if !cmds_succeeded {
+            on_err(
+                "At least one command failed to be executed, \
+                see local console for more info."
+                    .to_string(),
+            );
+        }
+    }
+
+    fn handle_console_events_impl(
         &mut self,
         native: &mut dyn NativeImpl,
         events: Vec<LocalConsoleEvent>,
+        depth: usize,
     ) {
         for event in events {
             match event {
@@ -2010,7 +2191,7 @@ impl ClientNativeImpl {
                                 &mut local_player.binds,
                                 !was_player_profile,
                                 &self.local_console.entries,
-                                &mut game.parser_cache,
+                                &game.parser_cache,
                             );
                         };
 
@@ -2030,6 +2211,23 @@ impl ClientNativeImpl {
                             set_binds(local_player);
                         }
                     }
+                }
+                LocalConsoleEvent::Exec { file_path } => Self::handle_exec(
+                    &self.io.clone().into(),
+                    file_path,
+                    &mut self.config.engine,
+                    &mut self.config.game,
+                    &self.local_console.entries,
+                    &self.local_console.user,
+                    |err| {
+                        self.notifications.add_err(err, Duration::from_secs(10));
+                    },
+                    |msg| {
+                        self.console_logs.push_str(&msg);
+                    },
+                ),
+                LocalConsoleEvent::Echo { text } => {
+                    self.notifications.add_info(text, Duration::from_secs(2));
                 }
                 LocalConsoleEvent::ChangeDummy { dummy_index } => {
                     if let Game::Active(game) = &mut self.game {
@@ -2119,10 +2317,10 @@ impl ClientNativeImpl {
 
                     match name.as_str() {
                         "gl.vsync" => {
+                            // update vsync val in backend
                             self.on_vsync_change();
                         }
                         "gl.clear_color" => {
-                            // update vsync val in backend
                             self.graphics.backend_handle.update_clear_color(ColorRgba {
                                 r: self.config.engine.gl.clear_color.r as f32 / 255.0,
                                 g: self.config.engine.gl.clear_color.g as f32 / 255.0,
@@ -2138,8 +2336,51 @@ impl ClientNativeImpl {
                         }
                     }
                 }
+                LocalConsoleEvent::LocalPlayerAction(action) => {
+                    if let Game::Active(game) = &self.game {
+                        // handle a few actions directly
+                        match action {
+                            BindActionsLocalPlayer::Kill => {
+                                if let Some((local_player_id, _)) =
+                                    game.game_data.local.active_local_player()
+                                {
+                                    game.network.send_unordered_to_server(
+                                        &ClientToServerMessage::PlayerMsg((
+                                            *local_player_id,
+                                            ClientToServerPlayerMessage::Kill,
+                                        )),
+                                    );
+                                }
+                            }
+                            _ => {
+                                // ignore
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        let events = self.local_console.get_events();
+        let max_depth_reached = depth >= 16;
+        if !events.is_empty()
+            && events
+                .iter()
+                .any(|e| matches!(e, LocalConsoleEvent::Exec { .. }))
+            && !max_depth_reached
+        {
+            self.handle_console_events_impl(native, events, depth + 1);
+        } else if max_depth_reached {
+            self.notifications.add_err(
+                "Max recursion limit for processing console events reached.",
+                Duration::from_secs(5),
+            );
+        }
+    }
+
+    fn handle_console_events(&mut self, native: &mut dyn NativeImpl) {
+        let events = self.local_console.get_events();
+        self.handle_console_events_impl(native, events, 0);
     }
 }
 
@@ -2275,7 +2516,11 @@ impl FromNativeLoadingImpl<ClientNativeLoadingImpl> for ClientNativeImpl {
         ui_creator.load_font(&font_data);
         benchmark.bench("loading font");
 
-        let mut local_console = LocalConsoleBuilder::build(&ui_creator);
+        let mut local_console = loading
+            .local_console_builder
+            .take()
+            .unwrap_or_default()
+            .build(&ui_creator);
         benchmark.bench("local console");
 
         // then prepare components allocations etc.
@@ -2355,6 +2600,7 @@ impl FromNativeLoadingImpl<ClientNativeLoadingImpl> for ClientNativeImpl {
                 sound_props: Default::default(),
                 render_mod: RenderModTy::Native,
                 required_resources: Default::default(),
+                client_local_infos: Default::default(),
             },
         );
         benchmark.bench("menu map");
@@ -2369,7 +2615,14 @@ impl FromNativeLoadingImpl<ClientNativeLoadingImpl> for ClientNativeImpl {
             graphics_memory_usage.staging_memory_usage,
             &ui_creator,
         );
-        let notifications = ClientNotifications::new(&graphics, &loading.sys, &ui_creator);
+        let mut notifications = ClientNotifications::new(&graphics, &loading.sys, &ui_creator);
+        if loading.has_startup_errors {
+            notifications.add_err(
+                "Some startup commands failed to be parsed, \
+                please read the logs for more information.",
+                Duration::from_secs(5),
+            );
+        }
 
         let loading_page = Box::new(LoadingPage::new());
         let page_err = UiWasmManagerErrorPageErr::default();
@@ -2478,7 +2731,7 @@ impl FromNativeLoadingImpl<ClientNativeLoadingImpl> for ClientNativeImpl {
         let cur_time = loading.sys.time_get();
         let last_refresh_rate_time = cur_time;
 
-        native.mouse_grab();
+        native.confine_mouse(true);
         benchmark.bench("mouse grab");
 
         let mut global_binds = Binds::default();
@@ -2515,15 +2768,7 @@ impl FromNativeLoadingImpl<ClientNativeLoadingImpl> for ClientNativeImpl {
         );
         benchmark.bench("global binds");
 
-        let start_cmd = native.start_arguments().join(" ");
-        local_console.parse_cmd(
-            &start_cmd,
-            &mut loading.config_game,
-            &mut loading.config_engine,
-        );
-
         local_console.ui.ui_state.is_ui_open = false;
-        benchmark.bench("parsing start args");
 
         let mut client = Self {
             menu_map,
@@ -2553,7 +2798,7 @@ impl FromNativeLoadingImpl<ClientNativeLoadingImpl> for ClientNativeImpl {
             io,
             config: Config::new(loading.config_game, loading.config_engine),
             last_refresh_rate_time,
-            editor: None,
+            editor: Default::default(),
 
             local_console,
             console_logs: Default::default(),
@@ -2584,8 +2829,7 @@ impl FromNativeLoadingImpl<ClientNativeLoadingImpl> for ClientNativeImpl {
             string_pool: Pool::with_sized(256, || String::with_capacity(256)), // TODO: random values rn
         };
 
-        let events = client.local_console.get_events();
-        client.handle_console_events(native, events);
+        client.handle_console_events(native);
         benchmark.bench("finish init of client");
 
         Ok(client)
@@ -2628,9 +2872,13 @@ impl InputEventHandler for ClientNativeImpl {
         device: &native::native::DeviceId,
         key: PhysicalKey,
     ) {
-        #[cfg(feature = "alloc-track")]
+        #[cfg(feature = "alloc_track")]
         if key == PhysicalKey::Code(KeyCode::Pause) {
             track_report();
+        }
+        #[cfg(feature = "alloc_stats")]
+        if key == PhysicalKey::Code(KeyCode::Pause) {
+            stats_report();
         }
         self.inp_manager.key_up(window, device, &key)
     }
@@ -2736,7 +2984,7 @@ impl FromNativeImpl for ClientNativeImpl {
         let has_input = !self.ui_manager.ui.ui_state.is_ui_open
             && !self.local_console.ui.ui_state.is_ui_open
             && !self.game.remote_console_open()
-            && self.editor.is_none()
+            && !self.editor.is_open()
             && self.demo_player.is_none();
         if let Game::Active(game) = &mut self.game {
             // check loading of votes
@@ -2755,6 +3003,17 @@ impl FromNativeImpl for ClientNativeImpl {
                 self.votes.set_thumbnail_server_resource_download_url(
                     game.resource_download_server.clone(),
                 );
+            }
+            if self.votes.needs_misc_votes() {
+                if !game.misc_votes_loaded {
+                    game.misc_votes_loaded = true;
+                    game.network
+                        .send_unordered_to_server(&ClientToServerMessage::LoadVotes(
+                            MsgClLoadVotes::Misc { cached_votes: None },
+                        ));
+                }
+                self.votes
+                    .fill_misc_votes(game.game_data.misc_votes.clone());
             }
 
             if has_input {
@@ -2834,12 +3093,23 @@ impl FromNativeImpl for ClientNativeImpl {
                 }
 
                 let player = game.game_data.local.active_local_player();
-                let show_cursor = player.is_some_and(|(_, p)| p.spectator_selection_active);
-                native.toggle_cursor(show_cursor);
+                let needs_abs_cursor = player.is_some_and(|(_, p)| {
+                    p.spectator_selection_active
+                        && (game.map.game.info.options.has_ingame_freecam
+                            || match p.input_cam_mode {
+                                PlayerCameraMode::Default => false,
+                                PlayerCameraMode::Free => true,
+                                PlayerCameraMode::LockedTo { locked_ingame, .. }
+                                | PlayerCameraMode::LockedOn { locked_ingame, .. } => {
+                                    !locked_ingame
+                                }
+                            })
+                });
+                native.relative_mouse(!needs_abs_cursor);
 
                 self.inp_manager.set_last_known_cursor(
                     &self.config.engine,
-                    if show_cursor {
+                    if needs_abs_cursor {
                         CursorIcon::Default
                     } else {
                         CursorIcon::None
@@ -3145,7 +3415,7 @@ impl FromNativeImpl for ClientNativeImpl {
     }
 
     fn destroy(mut self) {
-        #[cfg(feature = "alloc-track")]
+        #[cfg(feature = "alloc_track")]
         track_report();
 
         if !self.config.engine.ui.keep {

@@ -1,6 +1,7 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -41,11 +42,10 @@ use graphics::{
         stream::stream::GraphicsStreamHandle,
         texture::texture::{GraphicsTextureHandle, TextureContainer, TextureContainer2dArray},
     },
-    image::texture_2d_to_3d,
 };
 use graphics_types::{commands::TexFlags, types::GraphicsMemoryAllocationType};
 use hiarc::HiarcTrait;
-use image::png::load_png_image;
+use image_utils::{png::load_png_image_as_rgba, utils::texture_2d_to_3d};
 use map::{
     map::{
         animations::{AnimBase, AnimPointCurveType, AnimPointPos},
@@ -107,10 +107,12 @@ use crate::{
         finish_physics_layer_buffer, upload_design_quad_layer_buffer,
         upload_design_tile_layer_buffer, upload_physics_layer_buffer,
     },
-    notifications::EditorNotifications,
+    notifications::{EditorNotification, EditorNotifications},
+    physics_layers::PhysicsLayerOverlaysDdnet,
     server::EditorServer,
     tab::EditorTab,
     tools::{
+        auto_saver::AutoSaver,
         quad_layer::{brush::QuadBrush, selection::QuadSelection},
         sound_layer::brush::SoundBrush,
         tile_layer::{
@@ -122,7 +124,10 @@ use crate::{
         },
         utils::{render_rect, render_rect_from_state, render_rect_state},
     },
-    ui::user_data::{EditorUiEvent, EditorUiEventHostMap},
+    ui::user_data::{
+        EditorMenuDialogMode, EditorModalDialogMode, EditorTabsRefMut, EditorUiEvent,
+        EditorUiEventHostMap,
+    },
     utils::{ui_pos_to_world_pos, UiCanvasSize},
 };
 
@@ -130,6 +135,42 @@ use crate::{
 enum ReadFileTy {
     Image,
     Sound,
+}
+
+#[derive(Debug, Default)]
+struct MapLoadWithServerOptions {
+    cert: Option<NetworkServerCertMode>,
+    port: Option<u16>,
+    password: Option<String>,
+    mapper_name: Option<String>,
+    color: Option<[u8; 3]>,
+    /// If `Some` allows to change server settings remotely.
+    admin_password: Option<String>,
+}
+
+#[derive(Debug)]
+enum MapLoadOptions {
+    WithServer(MapLoadWithServerOptions),
+    WithoutServer {
+        server_addr: String,
+        cert_hash: Hash,
+        password: String,
+        mapper_name: String,
+        color: [u8; 3],
+    },
+}
+
+impl Default for MapLoadOptions {
+    fn default() -> Self {
+        Self::WithServer(MapLoadWithServerOptions {
+            cert: None,
+            port: None,
+            password: None,
+            mapper_name: None,
+            color: None,
+            admin_password: None,
+        })
+    }
 }
 
 /// this is basically the editor client
@@ -181,8 +222,6 @@ pub struct Editor {
     thread_pool: Arc<rayon::ThreadPool>,
 
     save_tasks: Vec<IoRuntimeTask<()>>,
-
-    is_closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -235,7 +274,7 @@ impl Editor {
 
         let fake_texture_array = graphics
             .texture_handle
-            .load_texture_3d_rgba_u8(mem, "fake-editor-texture")
+            .load_texture_2d_array_rgba_u8(mem, "fake-editor-texture")
             .unwrap();
 
         // fake texture texture for non textured quads
@@ -261,6 +300,9 @@ impl Editor {
         let mut ui_creator = UiCreator::default();
         ui_creator.load_font(font_data);
 
+        let overlays = PhysicsLayerOverlaysDdnet::new(io, tp, graphics)
+            .expect("Data files for editor are wrong");
+
         let mut res = Self {
             tabs: Default::default(),
             active_tab: "".into(),
@@ -274,6 +316,7 @@ impl Editor {
                         &graphics_mt,
                         &graphics.buffer_object_handle,
                         &graphics.backend_handle,
+                        &overlays,
                     ),
                     selection: TileSelection::new(),
                 },
@@ -329,55 +372,87 @@ impl Editor {
             save_tasks: Default::default(),
 
             sys,
-
-            is_closed: false,
         };
-        res.load_map("map/maps/ctf1.twmap".as_ref());
+        res.load_map("map/maps/ctf1.twmap".as_ref(), Default::default());
         res
     }
 
-    pub fn new_map(
-        &mut self,
-        name: &str,
-        server_cert_hash: Option<Hash>,
-        server_addr: Option<String>,
-        server_password: Option<String>,
-    ) {
-        let server = server_cert_hash
-            .is_none()
-            .then(|| EditorServer::new(&self.sys, None, None, "".into()));
+    fn new_map(&mut self, name: &str, options: MapLoadOptions) {
+        let res = match options {
+            MapLoadOptions::WithServer(MapLoadWithServerOptions {
+                cert,
+                port,
+                password,
+                mapper_name,
+                color,
+                admin_password,
+            }) => EditorServer::new(
+                &self.sys,
+                cert,
+                port,
+                password.unwrap_or_default(),
+                admin_password,
+            )
+            .map(|server| {
+                (
+                    format!("127.0.0.1:{}", server.port,),
+                    match &server.cert {
+                        NetworkServerCertModeResult::Cert { cert } => {
+                            NetworkClientCertCheckMode::CheckByCert {
+                                cert: cert.to_der().unwrap().into(),
+                            }
+                        }
+                        NetworkServerCertModeResult::PubKeyHash { hash } => {
+                            NetworkClientCertCheckMode::CheckByPubKeyHash {
+                                hash: Cow::Owned(*hash),
+                            }
+                        }
+                    },
+                    server.password.clone(),
+                    true,
+                    Some(server),
+                    mapper_name,
+                    color,
+                )
+            }),
+            MapLoadOptions::WithoutServer {
+                server_addr,
+                cert_hash,
+                password,
+                mapper_name,
+                color,
+            } => anyhow::Ok((
+                server_addr,
+                NetworkClientCertCheckMode::CheckByPubKeyHash {
+                    hash: Cow::Owned(cert_hash),
+                },
+                password,
+                false,
+                None,
+                Some(mapper_name),
+                Some(color),
+            )),
+        };
+        let (server_addr, server_cert, password, local_client, server, mapper_name, color) =
+            match res {
+                Ok(res) => res,
+                Err(err) => {
+                    self.notifications_overlay.add_err(
+                        format!("Failed to start server: {err}"),
+                        Duration::from_secs(10),
+                    );
+                    return;
+                }
+            };
         let client = EditorClient::new(
             &self.sys,
-            &if let Some(server_addr) = &server_addr {
-                server_addr.clone()
-            } else {
-                format!(
-                    "0.0.0.0:{}",
-                    server
-                        .as_ref()
-                        .map(|server| server.port)
-                        .unwrap_or_default()
-                )
-            },
-            match &server {
-                Some(server) => match &server.cert {
-                    NetworkServerCertModeResult::Cert { cert } => {
-                        NetworkClientCertCheckMode::CheckByCert {
-                            cert: cert.to_der().unwrap().into(),
-                        }
-                    }
-                    NetworkServerCertModeResult::PubKeyHash { hash } => {
-                        NetworkClientCertCheckMode::CheckByPubKeyHash { hash }
-                    }
-                },
-                None => match &server_cert_hash {
-                    Some(hash) => NetworkClientCertCheckMode::CheckByPubKeyHash { hash },
-                    None => panic!("this should not happen: server and server cert hash are None"),
-                },
-            },
+            &server_addr,
+            server_cert,
             self.notifications.clone(),
-            server_password.unwrap_or_default(),
-            server_addr.is_none(),
+            password,
+            local_client,
+            mapper_name,
+            color,
         );
 
         let physics_group_attr = MapGroupPhysicsAttr {
@@ -437,8 +512,12 @@ impl Editor {
                                         attr: EditorCommonGroupOrLayerAttr::default(),
                                         selected: Default::default(),
                                         number_extra: Default::default(),
-                                        number_extra_texts: Default::default(),
+                                        number_extra_text: Default::default(),
                                         context_menu_open: false,
+                                        switch_delay: Default::default(),
+                                        speedup_force: Default::default(),
+                                        speedup_angle: Default::default(),
+                                        speedup_max_speed: Default::default(),
                                     },
                                 },
                             )],
@@ -455,7 +534,7 @@ impl Editor {
                         def: Config {
                             commands: Default::default(),
                         },
-                        user: (),
+                        user: Default::default(),
                     },
                     meta: EditorMetadata {
                         def: Metadata {
@@ -475,6 +554,15 @@ impl Editor {
                 ),
                 server,
                 client,
+                auto_saver: AutoSaver {
+                    active: false,
+                    interval: Some(Duration::from_secs(60)),
+                    path: None,
+                    last_time: Some(self.sys.time_get()),
+                },
+                last_info_update: None,
+                admin_panel: Default::default(),
+                dbg_panel: Default::default(),
             },
         );
         self.active_tab = name.into();
@@ -504,7 +592,7 @@ impl Editor {
                                     let file = resources.get(&meta.blake3_hash).unwrap();
 
                                     let mut mem = None;
-                                    let _ = load_png_image(file, |width, height, _| {
+                                    let _ = load_png_image_as_rgba(file, |width, height, _| {
                                         mem = Some(graphics_mt.mem_alloc(
                                             GraphicsMemoryAllocationType::TextureRgbaU8 {
                                                 width: width.try_into().unwrap(),
@@ -531,7 +619,7 @@ impl Editor {
                                     let file = resources.get(&meta.blake3_hash).unwrap();
 
                                     let mut png = Vec::new();
-                                    let img = load_png_image(
+                                    let img = load_png_image_as_rgba(
                                         file,
                                         |width, height, color_chanel_count| {
                                             png.resize(
@@ -792,14 +880,14 @@ impl Editor {
                     .map(|((mem, file), hq_mem_file, i)| EditorImage2dArray {
                         user: EditorResource {
                             user: texture_handle
-                                .load_texture_3d_rgba_u8(mem, i.name.as_str())
+                                .load_texture_2d_array_rgba_u8(mem, i.name.as_str())
                                 .unwrap(),
                             file: file.into(),
                             hq: hq_mem_file.map(|(mem, file)| {
                                 (
                                     file.into(),
                                     texture_handle
-                                        .load_texture_3d_rgba_u8(mem, i.name.as_str())
+                                        .load_texture_2d_array_rgba_u8(mem, i.name.as_str())
                                         .unwrap(),
                                 )
                             }),
@@ -864,8 +952,12 @@ impl Editor {
                                 attr: EditorCommonGroupOrLayerAttr::default(),
                                 selected: Default::default(),
                                 number_extra: Default::default(),
-                                number_extra_texts: Default::default(),
+                                number_extra_text: Default::default(),
                                 context_menu_open: false,
+                                switch_delay: Default::default(),
+                                speedup_force: Default::default(),
+                                speedup_angle: Default::default(),
+                                speedup_max_speed: Default::default(),
                             };
                             match layer {
                                 MapLayerPhysics::Arbitrary(layer) => EditorPhysicsLayer::Arbitrary(
@@ -922,7 +1014,7 @@ impl Editor {
             },
             config: EditorConfig {
                 def: map.config,
-                user: (),
+                user: Default::default(),
             },
             meta: EditorMetadata {
                 def: map.meta,
@@ -945,13 +1037,21 @@ impl Editor {
         )
     }
 
-    #[cfg(feature = "legacy")]
-    pub fn load_legacy_map(&mut self, path: &Path) -> anyhow::Result<()> {
-        let name = path
+    fn path_to_tab_name(path: &Path) -> anyhow::Result<String> {
+        Ok(path
             .file_stem()
             .ok_or_else(|| anyhow!("{path:?} is not a valid file"))?
             .to_string_lossy()
-            .to_string();
+            .to_string())
+    }
+
+    #[cfg(feature = "legacy")]
+    fn load_legacy_map(
+        &mut self,
+        path: &Path,
+        options: MapLoadWithServerOptions,
+    ) -> anyhow::Result<()> {
+        let name = Self::path_to_tab_name(path)?;
 
         let tp = self.thread_pool.clone();
         let fs = self.io.fs.clone();
@@ -987,7 +1087,13 @@ impl Editor {
             .collect();
         let map = self.map_to_editor_map(map.map, resources);
 
-        let server = EditorServer::new(&self.sys, None, None, "".into());
+        let server = EditorServer::new(
+            &self.sys,
+            options.cert,
+            options.port,
+            options.password.clone().unwrap_or_default(),
+            options.admin_password,
+        )?;
         let client = EditorClient::new(
             &self.sys,
             &format!("127.0.0.1:{}", server.port),
@@ -998,12 +1104,16 @@ impl Editor {
                     }
                 }
                 NetworkServerCertModeResult::PubKeyHash { hash } => {
-                    NetworkClientCertCheckMode::CheckByPubKeyHash { hash }
+                    NetworkClientCertCheckMode::CheckByPubKeyHash {
+                        hash: Cow::Borrowed(hash),
+                    }
                 }
             },
             self.notifications.clone(),
-            "".into(),
+            options.password.unwrap_or_default(),
             true,
+            options.mapper_name,
+            options.color,
         );
 
         self.tabs.insert(
@@ -1017,6 +1127,15 @@ impl Editor {
                 ),
                 server: Some(server),
                 client,
+                auto_saver: AutoSaver {
+                    active: false,
+                    interval: Some(Duration::from_secs(60)),
+                    path: Some(path.into()),
+                    last_time: Some(self.sys.time_get()),
+                },
+                last_info_update: None,
+                admin_panel: Default::default(),
+                dbg_panel: Default::default(),
             },
         );
         self.active_tab = name;
@@ -1025,7 +1144,11 @@ impl Editor {
     }
 
     #[cfg(not(feature = "legacy"))]
-    pub fn load_legacy_map(&mut self, _path: &Path) -> anyhow::Result<()> {
+    fn load_legacy_map(
+        &mut self,
+        _path: &Path,
+        _options: MapLoadWithServerOptions,
+    ) -> anyhow::Result<()> {
         Err(anyhow!("loading legacy maps is not supported"))
     }
 
@@ -1043,21 +1166,16 @@ impl Editor {
         )
     }
 
-    pub fn load_map_impl(
+    fn load_map_impl(
         &mut self,
         path: &Path,
-        cert: Option<NetworkServerCertMode>,
-        port: Option<u16>,
-        password: Option<String>,
+        options: MapLoadWithServerOptions,
     ) -> anyhow::Result<()> {
-        let name = path
-            .file_stem()
-            .ok_or_else(|| anyhow!("{path:?} is not a valid file"))?
-            .to_string_lossy()
-            .to_string();
+        let name = Self::path_to_tab_name(path)?;
 
         let fs = self.io.fs.clone();
         let tp = self.thread_pool.clone();
+        let load_path = path.to_path_buf();
         let path = path.to_path_buf();
         let (map, resources) = self
             .io
@@ -1120,7 +1238,13 @@ impl Editor {
 
         let map = self.map_to_editor_map(map, resources);
 
-        let server = EditorServer::new(&self.sys, cert, port, password.clone().unwrap_or_default());
+        let server = EditorServer::new(
+            &self.sys,
+            options.cert,
+            options.port,
+            options.password.clone().unwrap_or_default(),
+            options.admin_password,
+        )?;
         let client = EditorClient::new(
             &self.sys,
             &format!("127.0.0.1:{}", server.port),
@@ -1131,12 +1255,16 @@ impl Editor {
                     }
                 }
                 NetworkServerCertModeResult::PubKeyHash { hash } => {
-                    NetworkClientCertCheckMode::CheckByPubKeyHash { hash }
+                    NetworkClientCertCheckMode::CheckByPubKeyHash {
+                        hash: Cow::Borrowed(hash),
+                    }
                 }
             },
             self.notifications.clone(),
-            password.unwrap_or_default(),
+            options.password.unwrap_or_default(),
             true,
+            options.mapper_name,
+            options.color,
         );
 
         self.tabs.insert(
@@ -1150,6 +1278,15 @@ impl Editor {
                 ),
                 server: Some(server),
                 client,
+                auto_saver: AutoSaver {
+                    active: false,
+                    interval: Some(Duration::from_secs(60)),
+                    path: Some(load_path),
+                    last_time: Some(self.sys.time_get()),
+                },
+                last_info_update: None,
+                admin_panel: Default::default(),
+                dbg_panel: Default::default(),
             },
         );
         self.active_tab = name;
@@ -1157,177 +1294,209 @@ impl Editor {
         Ok(())
     }
 
-    pub fn load_map(&mut self, path: &Path) {
+    /// Loads either a legacy or new map based on the file extension.
+    fn load_map(&mut self, path: &Path, options: MapLoadWithServerOptions) {
         let res = if path.extension().is_some_and(|ext| ext == "map") {
-            self.load_legacy_map(path)
+            self.load_legacy_map(path, options)
         } else {
-            self.load_map_impl(path, None, None, None)
+            self.load_map_impl(path, options)
         };
         if let Err(err) = res {
+            log::error!("{err}");
             self.notifications_overlay
                 .add_err(err.to_string(), Duration::from_secs(10));
         }
     }
 
     #[cfg(feature = "legacy")]
-    pub fn save_map_legacy(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub fn save_map_legacy(
+        tab: &mut EditorTab,
+        io: &Io,
+        tp: &Arc<rayon::ThreadPool>,
+        path: &Path,
+    ) -> anyhow::Result<IoRuntimeTask<()>> {
         use map::map::resources::MapResourceRef;
 
-        if self.tabs.get(&self.active_tab).is_some() {
-            let (map, resources) = self.save_map_impl().ok_or_else(|| {
-                anyhow!(
-                    "Map was not saved, is \
-                    there any map active?"
-                )
-            })?;
+        tab.auto_saver.path = Some(path.to_path_buf());
+        let (map, resources, path) = Self::save_map_tab_impl(tab, path);
 
-            let tp = self.thread_pool.clone();
-            let fs = self.io.fs.clone();
-            let path = path.to_path_buf();
-            self.save_tasks.push(self.io.rt.spawn(async move {
-                let mut file: Vec<u8> = Default::default();
-                map.write(&mut file, &tp)?;
-                let map_legacy = map_convert_lib::new_to_legacy::new_to_legacy_from_buf_async(
-                    &file,
-                    |map| {
-                        let map_resources = map.resources.clone();
-                        Box::pin(async move {
-                            let collect_resources = |res: &[MapResourceRef], ty: ReadFileTy| {
-                                res.iter()
-                                    .map(|r| {
-                                        resources
-                                            .get(&Self::map_resource_path(
-                                                ty,
-                                                r.name.as_str(),
-                                                &r.meta,
-                                            ))
-                                            .cloned()
-                                            .unwrap()
-                                    })
-                                    .collect()
-                            };
-                            Ok((
-                                collect_resources(&map_resources.images, ReadFileTy::Image),
-                                collect_resources(&map_resources.image_arrays, ReadFileTy::Image),
-                                collect_resources(&map_resources.sounds, ReadFileTy::Sound),
-                            ))
-                        })
-                    },
-                    &tp,
-                )
-                .await?;
+        let tp = tp.clone();
+        let fs = io.fs.clone();
+        Ok(io.rt.spawn(async move {
+            let mut file: Vec<u8> = Default::default();
+            map.write(&mut file, &tp)?;
+            let map_legacy = map_convert_lib::new_to_legacy::new_to_legacy_from_buf_async(
+                &file,
+                |map| {
+                    let map_resources = map.resources.clone();
+                    Box::pin(async move {
+                        let collect_resources = |res: &[MapResourceRef], ty: ReadFileTy| {
+                            res.iter()
+                                .map(|r| {
+                                    resources
+                                        .get(&Self::map_resource_path(ty, r.name.as_str(), &r.meta))
+                                        .cloned()
+                                        .unwrap()
+                                })
+                                .collect()
+                        };
+                        Ok((
+                            collect_resources(&map_resources.images, ReadFileTy::Image),
+                            collect_resources(&map_resources.image_arrays, ReadFileTy::Image),
+                            collect_resources(&map_resources.sounds, ReadFileTy::Sound),
+                        ))
+                    })
+                },
+                &tp,
+            )
+            .await?;
 
-                fs.write_file(&path, map_legacy.map).await?;
-                Ok(())
-            }));
-        }
-        Ok(())
+            fs.write_file(&path, map_legacy.map).await?;
+            Ok(())
+        }))
     }
 
     #[cfg(not(feature = "legacy"))]
-    pub fn save_map_legacy(&mut self, _path: &Path) -> anyhow::Result<()> {
+    pub fn save_map_legacy(
+        tab: &mut EditorTab,
+        io: &Io,
+        tp: &Arc<rayon::ThreadPool>,
+        path: &Path,
+    ) -> anyhow::Result<IoRuntimeTask<()>> {
         Err(anyhow!("saving as legacy map is not supported"))
     }
 
-    fn save_map_impl(&mut self) -> Option<(Map, HashMap<String, Vec<u8>>)> {
-        if let Some(tab) = self.tabs.get(&self.active_tab) {
-            let map: Map = tab.map.clone().into();
-            let resources =
-                tab.map
-                    .resources
-                    .images
-                    .iter()
-                    .flat_map(|r| {
-                        [(
-                            format!(
-                                "map/resources/images/{}_{}.{}",
-                                r.def.name.as_str(),
-                                fmt_hash(&r.def.meta.blake3_hash),
-                                r.def.meta.ty.as_str()
-                            ),
-                            r.user.file.as_ref().clone(),
-                        )]
-                        .into_iter()
-                        .chain(r.user.hq.as_ref().zip(r.def.hq_meta.as_ref()).map(
-                            |((f, _), meta)| {
-                                (
-                                    format!(
-                                        "map/resources/images/{}_{}.{}",
-                                        r.def.name.as_str(),
-                                        fmt_hash(&meta.blake3_hash),
-                                        meta.ty.as_str()
-                                    ),
-                                    f.as_ref().clone(),
-                                )
-                            },
-                        ))
-                        .collect::<Vec<_>>()
-                    })
-                    .chain(tab.map.resources.image_arrays.iter().flat_map(|r| {
-                        [(
-                            format!(
-                                "map/resources/images/{}_{}.{}",
-                                r.def.name.as_str(),
-                                fmt_hash(&r.def.meta.blake3_hash),
-                                r.def.meta.ty.as_str()
-                            ),
-                            r.user.file.as_ref().clone(),
-                        )]
-                        .into_iter()
-                        .chain(r.user.hq.as_ref().zip(r.def.hq_meta.as_ref()).map(
-                            |((f, _), meta)| {
-                                (
-                                    format!(
-                                        "map/resources/images/{}_{}.{}",
-                                        r.def.name.as_str(),
-                                        fmt_hash(&meta.blake3_hash),
-                                        meta.ty.as_str()
-                                    ),
-                                    f.as_ref().clone(),
-                                )
-                            },
-                        ))
-                        .collect::<Vec<_>>()
-                    }))
-                    .chain(tab.map.resources.sounds.iter().flat_map(|r| {
-                        [(
-                            format!(
-                                "map/resources/sounds/{}_{}.{}",
-                                r.def.name.as_str(),
-                                fmt_hash(&r.def.meta.blake3_hash),
-                                r.def.meta.ty.as_str()
-                            ),
-                            r.user.file.as_ref().clone(),
-                        )]
-                        .into_iter()
-                        .chain(r.user.hq.as_ref().zip(r.def.hq_meta.as_ref()).map(
-                            |((f, _), meta)| {
-                                (
-                                    format!(
-                                        "map/resources/sounds/{}_{}.{}",
-                                        r.def.name.as_str(),
-                                        fmt_hash(&meta.blake3_hash),
-                                        meta.ty.as_str()
-                                    ),
-                                    f.as_ref().clone(),
-                                )
-                            },
-                        ))
-                        .collect::<Vec<_>>()
-                    }))
-                    .collect::<HashMap<_, _>>();
-            Some((map, resources))
-        } else {
-            None
-        }
+    fn save_map_tab_impl(
+        tab: &mut EditorTab,
+        path: &Path,
+    ) -> (Map, HashMap<String, Vec<u8>>, PathBuf) {
+        tab.auto_saver.path = Some(path.to_path_buf());
+        let map: Map = tab.map.clone().into();
+        let resources = tab
+            .map
+            .resources
+            .images
+            .iter()
+            .flat_map(|r| {
+                [(
+                    format!(
+                        "map/resources/images/{}_{}.{}",
+                        r.def.name.as_str(),
+                        fmt_hash(&r.def.meta.blake3_hash),
+                        r.def.meta.ty.as_str()
+                    ),
+                    r.user.file.as_ref().clone(),
+                )]
+                .into_iter()
+                .chain(
+                    r.user
+                        .hq
+                        .as_ref()
+                        .zip(r.def.hq_meta.as_ref())
+                        .map(|((f, _), meta)| {
+                            (
+                                format!(
+                                    "map/resources/images/{}_{}.{}",
+                                    r.def.name.as_str(),
+                                    fmt_hash(&meta.blake3_hash),
+                                    meta.ty.as_str()
+                                ),
+                                f.as_ref().clone(),
+                            )
+                        }),
+                )
+                .collect::<Vec<_>>()
+            })
+            .chain(tab.map.resources.image_arrays.iter().flat_map(|r| {
+                [(
+                    format!(
+                        "map/resources/images/{}_{}.{}",
+                        r.def.name.as_str(),
+                        fmt_hash(&r.def.meta.blake3_hash),
+                        r.def.meta.ty.as_str()
+                    ),
+                    r.user.file.as_ref().clone(),
+                )]
+                .into_iter()
+                .chain(
+                    r.user
+                        .hq
+                        .as_ref()
+                        .zip(r.def.hq_meta.as_ref())
+                        .map(|((f, _), meta)| {
+                            (
+                                format!(
+                                    "map/resources/images/{}_{}.{}",
+                                    r.def.name.as_str(),
+                                    fmt_hash(&meta.blake3_hash),
+                                    meta.ty.as_str()
+                                ),
+                                f.as_ref().clone(),
+                            )
+                        }),
+                )
+                .collect::<Vec<_>>()
+            }))
+            .chain(tab.map.resources.sounds.iter().flat_map(|r| {
+                [(
+                    format!(
+                        "map/resources/sounds/{}_{}.{}",
+                        r.def.name.as_str(),
+                        fmt_hash(&r.def.meta.blake3_hash),
+                        r.def.meta.ty.as_str()
+                    ),
+                    r.user.file.as_ref().clone(),
+                )]
+                .into_iter()
+                .chain(
+                    r.user
+                        .hq
+                        .as_ref()
+                        .zip(r.def.hq_meta.as_ref())
+                        .map(|((f, _), meta)| {
+                            (
+                                format!(
+                                    "map/resources/sounds/{}_{}.{}",
+                                    r.def.name.as_str(),
+                                    fmt_hash(&meta.blake3_hash),
+                                    meta.ty.as_str()
+                                ),
+                                f.as_ref().clone(),
+                            )
+                        }),
+                )
+                .collect::<Vec<_>>()
+            }))
+            .collect::<HashMap<_, _>>();
+        (map, resources, path.to_path_buf())
     }
 
-    pub fn save_map(&mut self, path: &Path) -> Option<IoRuntimeTask<()>> {
-        self.save_map_impl().map(|(map, resources)| {
-            let tp = self.thread_pool.clone();
-            let fs = self.io.fs.clone();
-            let path = path.to_path_buf();
-            self.io.rt.spawn(async move {
+    pub fn save_map_tab(
+        tab: &mut EditorTab,
+        io: &Io,
+        tp: &Arc<rayon::ThreadPool>,
+
+        save_tasks: &mut Vec<IoRuntimeTask<()>>,
+        notifications_overlay: &mut ClientNotifications,
+        path: &Path,
+    ) {
+        tab.client.should_save = false;
+        if path.extension().is_some_and(|ext| ext == "map") {
+            match Self::save_map_legacy(tab, io, tp, path) {
+                Ok(task) => {
+                    save_tasks.push(task);
+                }
+                Err(err) => {
+                    log::error!("{err}");
+                    notifications_overlay.add_err(err.to_string(), Duration::from_secs(10));
+                }
+            }
+        } else {
+            let (map, resources, path) = Self::save_map_tab_impl(tab, path);
+            let tp = tp.clone();
+            let fs = io.fs.clone();
+
+            save_tasks.push(io.rt.spawn(async move {
                 fs.create_dir("map/maps".as_ref()).await?;
                 fs.create_dir("map/resources/images".as_ref()).await?;
                 fs.create_dir("map/resources/sounds".as_ref()).await?;
@@ -1341,8 +1510,82 @@ impl Editor {
                     fs.write_file(path.as_ref(), resource).await?;
                 }
                 Ok(())
-            })
-        })
+            }));
+        }
+    }
+
+    pub fn save_map(&mut self, path: &Path) {
+        if let Some(tab) = self.tabs.get_mut(&self.active_tab) {
+            Self::save_map_tab(
+                tab,
+                &self.io,
+                &self.thread_pool,
+                &mut self.save_tasks,
+                &mut self.notifications_overlay,
+                path,
+            );
+        } else {
+            let msg = "No map was loaded to be saved.";
+            log::info!("{msg}");
+            self.notifications_overlay
+                .add_err(msg, Duration::from_secs(10));
+        }
+    }
+
+    fn save_tab(&mut self, tab: &str) -> bool {
+        if let Some((path, tab)) = self
+            .tabs
+            .get_mut(tab)
+            .and_then(|tab| tab.auto_saver.path.clone().map(|path| (path.clone(), tab)))
+        {
+            Self::save_map_tab(
+                tab,
+                &self.io,
+                &self.thread_pool,
+                &mut self.save_tasks,
+                &mut self.notifications_overlay,
+                &path,
+            );
+            true
+        } else {
+            let msg = "The current map has never been saved.\n\
+            It has to be saved using the GUI at least once.";
+            log::info!("{msg}");
+            self.notifications_overlay
+                .add_err(msg, Duration::from_secs(10));
+
+            self.ui.menu_dialog_mode = EditorMenuDialogMode::save(&self.io);
+            false
+        }
+    }
+
+    fn save_all_tabs(&mut self) -> bool {
+        let mut all_saved = true;
+        for (path, tab) in self
+            .tabs
+            .values_mut()
+            .map(|tab| (tab.auto_saver.path.clone(), tab))
+        {
+            if let Some(path) = path {
+                Self::save_map_tab(
+                    tab,
+                    &self.io,
+                    &self.thread_pool,
+                    &mut self.save_tasks,
+                    &mut self.notifications_overlay,
+                    &path,
+                );
+            } else {
+                let msg = "Some maps have never been saved.\n\
+                    It has to be saved using the GUI at least once.";
+                log::info!("{msg}");
+                self.notifications_overlay
+                    .add_err(msg, Duration::from_secs(10));
+                all_saved = false;
+            }
+        }
+
+        all_saved
     }
 
     fn update(&mut self) {
@@ -1361,6 +1604,7 @@ impl Editor {
                 &self.backend_handle,
                 &self.texture_handle,
                 &mut tab.map,
+                &mut tab.admin_panel,
             );
             if update_res.is_err() {
                 removed_tabs.push(tab_name.clone());
@@ -1388,7 +1632,35 @@ impl Editor {
                     &self.backend_handle,
                     &self.texture_handle,
                     &mut tab.map,
+                    &mut tab.auto_saver,
+                    &mut self.notifications_overlay,
+                    &mut tab.client.should_save,
                 );
+            }
+
+            if tab.auto_saver.active {
+                let last_time = tab
+                    .auto_saver
+                    .last_time
+                    .get_or_insert_with(|| self.sys.time_get());
+
+                if let (Some(interval), Some(path)) =
+                    (tab.auto_saver.interval, tab.auto_saver.path.as_ref())
+                {
+                    let cur_time = self.sys.time_get();
+                    if cur_time.saturating_sub(*last_time) > interval {
+                        *last_time = cur_time;
+                        let path = path.clone();
+                        Self::save_map_tab(
+                            tab,
+                            &self.io,
+                            &self.thread_pool,
+                            &mut self.save_tasks,
+                            &mut self.notifications_overlay,
+                            &path,
+                        );
+                    }
+                }
             }
         }
         for tab in removed_tabs {
@@ -1445,6 +1717,12 @@ impl Editor {
         as_tile_numbers: Option<&TextureContainer2dArray>,
         layer_rect: &mut Vec<LayerRect>,
     ) {
+        let time = if map.user.ui_values.animations_panel_open {
+            map.user.ui_values.timeline.time()
+        } else {
+            map.user.time
+        };
+
         map_render.render_layer(
             animations,
             &map.resources,
@@ -1455,7 +1733,7 @@ impl Editor {
                 map.animation_tick(),
                 &map.game_time_info().intra_tick_time,
             ),
-            &map.user.time,
+            &time,
             &group.attr,
             layer,
             match layer {
@@ -1526,9 +1804,8 @@ impl Editor {
 
     fn render_group_clip(&self, map: &EditorMap, attr: MapGroupAttr) {
         let MapGroupAttr {
-            offset,
-            parallax,
             clipping: Some(clip),
+            ..
         } = attr
         else {
             return;
@@ -1549,8 +1826,8 @@ impl Editor {
             map,
             rect,
             color,
-            &vec2::new(parallax.x.to_num(), parallax.y.to_num()),
-            &vec2::new(offset.x.to_num(), offset.y.to_num()),
+            &vec2::new(100.0, 100.0),
+            &vec2::new(0.0, 0.0),
         );
     }
 
@@ -1980,11 +2257,7 @@ impl Editor {
             let range = range.indices_checked(layer);
 
             if !range.is_empty() {
-                let (_, quad) = range
-                    .iter()
-                    .next()
-                    .map(|(i, q)| (*i, (*q).clone()))
-                    .unwrap();
+                let (_, quad) = range.iter().next().map(|(i, q)| (*i, *(*q))).unwrap();
 
                 if let Some(pos_anim) = quad.pos_anim {
                     enum ReplOrInsert {
@@ -2117,8 +2390,8 @@ impl Editor {
         Option<InputState>,
         Option<UiCanvasSize>,
         egui::PlatformOutput,
+        Option<EditorResult>,
     ) {
-        let active_tab = self.tabs.get_mut(&self.active_tab);
         let mut unused_rect: Option<egui::Rect> = None;
         let mut input_state: Option<InputState> = None;
         let mut ui_canvas: Option<UiCanvasSize> = None;
@@ -2126,7 +2399,10 @@ impl Editor {
             cur_time: self.sys.time_get(),
             config,
             inp: input,
-            editor_tab: active_tab,
+            editor_tabs: EditorTabsRefMut {
+                tabs: &mut self.tabs,
+                active_tab: &mut self.active_tab,
+            },
             ui_events: &mut self.ui_events,
             unused_rect: &mut unused_rect,
             input_state: &mut input_state,
@@ -2136,13 +2412,32 @@ impl Editor {
             io: &self.io,
         });
 
+        let mut forced_result = None;
+
         // handle ui events
         for ev in std::mem::take(&mut self.ui_events) {
             match ev {
-                EditorUiEvent::OpenFile { name } => self.load_map(&name),
+                EditorUiEvent::NewMap => {
+                    self.new_map("new-map", Default::default());
+                }
+                EditorUiEvent::OpenFile { name } => self.load_map(&name, Default::default()),
                 EditorUiEvent::SaveFile { name } => {
-                    if let Some(task) = self.save_map(&name) {
-                        self.save_tasks.push(task);
+                    self.save_map(&name);
+                }
+                EditorUiEvent::SaveCurMap => {
+                    self.save_tab(&self.active_tab.clone());
+                }
+                EditorUiEvent::SaveMapAndClose { tab } => {
+                    if self.save_tab(&tab) {
+                        self.tabs.remove(&self.active_tab);
+                    }
+                }
+                EditorUiEvent::SaveAll => {
+                    self.save_all_tabs();
+                }
+                EditorUiEvent::SaveAllAndClose => {
+                    if self.save_all_tabs() {
+                        forced_result = Some(EditorResult::Close);
                     }
                 }
                 EditorUiEvent::HostMap(host_map) => {
@@ -2152,46 +2447,144 @@ impl Editor {
                         password,
                         cert,
                         private_key,
+                        mapper_name,
+                        color,
                     } = *host_map;
-                    if let Err(err) = self.load_map_impl(
+                    self.load_map(
                         map_path.as_ref(),
-                        Some(NetworkServerCertMode::FromCertAndPrivateKey(Box::new(
-                            NetworkServerCertAndKey { cert, private_key },
-                        ))),
-                        Some(port),
-                        Some(password),
-                    ) {
-                        self.notifications_overlay
-                            .add_err(err.to_string(), Duration::from_secs(10));
-                    }
+                        MapLoadWithServerOptions {
+                            cert: Some(NetworkServerCertMode::FromCertAndPrivateKey(Box::new(
+                                NetworkServerCertAndKey { cert, private_key },
+                            ))),
+                            port: Some(port),
+                            password: Some(password),
+                            mapper_name: Some(mapper_name),
+                            color: Some(color),
+                            admin_password: None,
+                        },
+                    );
                 }
                 EditorUiEvent::Join {
                     ip_port,
                     cert_hash,
                     password,
+                    mapper_name,
+                    color,
                 } => self.new_map(
-                    "loading",
-                    Some(
-                        (0..cert_hash.len())
+                    &ip_port.clone(),
+                    MapLoadOptions::WithoutServer {
+                        server_addr: ip_port,
+                        cert_hash: (0..cert_hash.len())
                             .step_by(2)
                             .map(|i| u8::from_str_radix(&cert_hash[i..i + 2], 16).unwrap())
                             .collect::<Vec<_>>()
                             .try_into()
                             .unwrap(),
-                    ),
-                    Some(ip_port),
-                    Some(password),
+                        password,
+                        mapper_name,
+                        color,
+                    },
                 ),
-                EditorUiEvent::Close => self.is_closed = true,
+                EditorUiEvent::Close => {
+                    if self.tabs.values().any(|t| t.client.should_save) {
+                        self.ui.modal_dialog_mode = EditorModalDialogMode::CloseEditor;
+                    } else {
+                        forced_result = Some(EditorResult::Close);
+                    }
+                }
+                EditorUiEvent::ForceClose => {
+                    forced_result = Some(EditorResult::Close);
+                }
+                EditorUiEvent::Minimize => {
+                    forced_result = Some(EditorResult::Minimize);
+                }
+                EditorUiEvent::Undo => {
+                    if let Some(tab) = self.tabs.get(&self.active_tab) {
+                        tab.client.undo();
+                    }
+                }
+                EditorUiEvent::Redo => {
+                    if let Some(tab) = self.tabs.get(&self.active_tab) {
+                        tab.client.redo();
+                    }
+                }
+                EditorUiEvent::CursorWorldPos { pos } => {
+                    if let Some(tab) = self.tabs.get_mut(&self.active_tab) {
+                        let now = self.sys.time_get();
+                        // 50 times per sec
+                        if tab.last_info_update.is_none_or(|last_info_update| {
+                            now.saturating_sub(last_info_update) > Duration::from_millis(20)
+                        }) {
+                            tab.client.update_info(pos);
+                            tab.last_info_update = Some(now);
+                        }
+                    }
+                }
+                EditorUiEvent::Chat { msg } => {
+                    if let Some(tab) = self.tabs.get(&self.active_tab) {
+                        tab.client.send_chat(msg);
+                    }
+                }
+                EditorUiEvent::AdminAuth { password } => {
+                    if let Some(tab) = self.tabs.get(&self.active_tab) {
+                        tab.client.admin_auth(password);
+                    }
+                }
+                EditorUiEvent::AdminChangeConfig { state } => {
+                    if let Some(tab) = self.tabs.get(&self.active_tab) {
+                        tab.client.admin_change_cfg(state);
+                    }
+                }
+                EditorUiEvent::DbgAction(props) => {
+                    if let Some(tab) = self.tabs.get(&self.active_tab) {
+                        tab.client.dbg_action(props);
+                    }
+                }
             }
         }
-        (unused_rect, input_state, ui_canvas, egui_output)
+        (
+            unused_rect,
+            input_state,
+            ui_canvas,
+            egui_output,
+            forced_result,
+        )
+    }
+
+    pub fn host_map(
+        &mut self,
+        path: &Path,
+        port: u16,
+        password: String,
+        admin_password: String,
+        cert_mode: NetworkServerCertMode,
+    ) {
+        self.load_map(
+            path,
+            MapLoadWithServerOptions {
+                cert: Some(cert_mode),
+                port: Some(port),
+                password: Some(password),
+                mapper_name: Some("server".to_string()),
+                color: None,
+                admin_password: Some(admin_password),
+            },
+        );
+
+        if let Some(tab) = Self::path_to_tab_name(path)
+            .ok()
+            .and_then(|tab| self.tabs.get_mut(&tab))
+        {
+            tab.auto_saver.active = true;
+            tab.auto_saver.interval = Some(Duration::from_secs(60 * 5));
+        }
     }
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum EditorResult {
     Close,
+    Minimize,
     PlatformOutput(egui::PlatformOutput),
 }
 
@@ -2215,7 +2608,8 @@ impl EditorInterface for Editor {
         self.render_tools(&self.latest_canvas_rect.clone());
 
         // then render the UI above it
-        let (unused_rect, input_state, canvas_size, ui_output) = self.render_ui(input, config);
+        let (unused_rect, input_state, canvas_size, ui_output, forced_result) =
+            self.render_ui(input, config);
         self.latest_canvas_rect = canvas_size.unwrap_or_else(|| {
             Rect::from_min_size(
                 pos2(0.0, 0.0),
@@ -2270,7 +2664,10 @@ impl EditorInterface for Editor {
         }
 
         if !ui_output.copied_text.is_empty() {
-            dbg!(&ui_output.copied_text);
+            log::info!(
+                "[Editor] Copied the following text: {}",
+                &ui_output.copied_text
+            );
         }
 
         // handle save tasks
@@ -2279,9 +2676,13 @@ impl EditorInterface for Editor {
             if task.is_finished() {
                 match task.get_storage() {
                     Ok(_) => {
+                        log::info!("Map saved.");
+                        self.notifications_overlay
+                            .add_info("Map saved.", Duration::from_secs(2));
                         // ignore
                     }
                     Err(err) => {
+                        log::error!("{err}");
                         self.notifications_overlay
                             .add_err(err.to_string(), Duration::from_secs(10));
                     }
@@ -2293,10 +2694,29 @@ impl EditorInterface for Editor {
         std::mem::swap(&mut self.save_tasks, &mut unfinished_tasks);
 
         // render the overlay for notifications
+        for ev in self.notifications.take() {
+            match ev {
+                EditorNotification::Error(msg) => {
+                    log::error!("{msg}");
+                    self.notifications_overlay
+                        .add_err(msg, Duration::from_secs(10));
+                }
+                EditorNotification::Warning(msg) => {
+                    log::warn!("{msg}");
+                    self.notifications_overlay
+                        .add_warn(msg, Duration::from_secs(10));
+                }
+                EditorNotification::Info(msg) => {
+                    log::info!("{msg}");
+                    self.notifications_overlay
+                        .add_info(msg, Duration::from_secs(5));
+                }
+            }
+        }
         self.notifications_overlay.render();
 
-        if self.is_closed {
-            EditorResult::Close
+        if let Some(res) = forced_result {
+            res
         } else {
             EditorResult::PlatformOutput(ui_output)
         }

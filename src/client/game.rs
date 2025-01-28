@@ -3,6 +3,7 @@ pub mod data;
 pub mod types;
 
 use std::{
+    borrow::Cow,
     net::SocketAddr,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
@@ -251,7 +252,9 @@ impl Game {
                             NetworkClientCertCheckMode::CheckByCert { cert: cert.into() }
                         }
                         ServerCertMode::Hash(hash) => {
-                            NetworkClientCertCheckMode::CheckByPubKeyHash { hash }
+                            NetworkClientCertCheckMode::CheckByPubKeyHash {
+                                hash: Cow::Borrowed(hash),
+                            }
                         }
                         ServerCertMode::Unknown => {
                             return Self::Err(anyhow!(
@@ -302,6 +305,7 @@ impl Game {
         timestamp: Duration,
         hint_start_camera_pos: vec2,
         config: &mut ConfigEngine,
+        config_game: &mut ConfigGame,
         connect: GameConnect,
         game_options: GameStateCreateOptions,
         props: RenderGameCreateOptions,
@@ -320,6 +324,7 @@ impl Game {
                 map_hash: *map_blake3_hash,
                 game_options: game_options.clone(),
                 required_resources,
+                client_local_infos: Self::character_net_infos(&expected_local_players, config_game),
                 physics_module: game_mod.clone(),
                 render_module: render_mod.clone(),
                 physics_group_name: props.physics_group_name.clone(),
@@ -361,6 +366,54 @@ impl Game {
             local_player_id_counter,
             active_local_player_id,
         })
+    }
+
+    pub fn player_net_infos(
+        expected_local_players: &FxLinkedHashMap<u64, ClientConnectedPlayer>,
+        config_game: &mut ConfigGame,
+    ) -> Vec<MsgClAddLocalPlayer> {
+        expected_local_players
+            .iter()
+            .map(|(&id, player)| {
+                let is_dummy = match player {
+                    ClientConnectedPlayer::Connecting { is_dummy } => is_dummy,
+                    ClientConnectedPlayer::Connected { is_dummy, .. } => is_dummy,
+                };
+                let player_info = if let Some((info, copy_info)) = is_dummy
+                    .then(|| {
+                        config_game
+                            .players
+                            .get(config_game.profiles.dummy.index as usize)
+                            .zip(config_game.players.get(config_game.profiles.main as usize))
+                    })
+                    .flatten()
+                {
+                    Game::network_char_info_from_config_for_dummy(
+                        &config_game.cl,
+                        info,
+                        copy_info,
+                        &config_game.profiles.dummy,
+                    )
+                } else if let Some(p) = config_game.players.get(config_game.profiles.main as usize)
+                {
+                    Self::network_char_info_from_config(&config_game.cl, p)
+                } else {
+                    // TODO: also support split screen some day
+                    NetworkCharacterInfo::explicit_default()
+                };
+                MsgClAddLocalPlayer { player_info, id }
+            })
+            .collect()
+    }
+
+    pub fn character_net_infos(
+        expected_local_players: &FxLinkedHashMap<u64, ClientConnectedPlayer>,
+        config_game: &mut ConfigGame,
+    ) -> Vec<NetworkCharacterInfo> {
+        Self::player_net_infos(expected_local_players, config_game)
+            .into_iter()
+            .map(|p| p.player_info)
+            .collect()
     }
 
     /// This
@@ -499,7 +552,7 @@ impl Game {
                             &mut p.binds,
                             p.is_dummy,
                             entries,
-                            &mut game.parser_cache,
+                            &game.parser_cache,
                         );
                     }
                 }
@@ -574,46 +627,8 @@ impl Game {
                 active_local_player_id,
             }) => {
                 if map.is_fully_loaded() {
-                    let players = expected_local_players
-                        .iter()
-                        .map(|(&id, player)| {
-                            let is_dummy = match player {
-                                ClientConnectedPlayer::Connecting { is_dummy } => is_dummy,
-                                ClientConnectedPlayer::Connected { is_dummy, .. } => is_dummy,
-                            };
-                            let player_info = if let Some((info, copy_info)) = is_dummy
-                                .then(|| {
-                                    config_game
-                                        .players
-                                        .get(config_game.profiles.dummy.index as usize)
-                                        .zip(
-                                            config_game
-                                                .players
-                                                .get(config_game.profiles.main as usize),
-                                        )
-                                })
-                                .flatten()
-                            {
-                                Game::network_char_info_from_config_for_dummy(
-                                    &config_game.cl,
-                                    info,
-                                    copy_info,
-                                    &config_game.profiles.dummy,
-                                )
-                            } else if let Some(p) =
-                                config_game.players.get(config_game.profiles.main as usize)
-                            {
-                                Self::network_char_info_from_config(&config_game.cl, p)
-                            } else {
-                                // TODO: also support split screen some day
-                                NetworkCharacterInfo::explicit_default()
-                            };
-                            MsgClAddLocalPlayer { player_info, id }
-                        })
-                        .collect();
-
                     network.send_unordered_to_server(&ClientToServerMessage::Ready(MsgClReady {
-                        players,
+                        players: Self::player_net_infos(&expected_local_players, config_game),
                         rcon_secret: connect.rcon_secret,
                     }));
                     let ClientMapLoading::Map(ClientMapFile::Game(map)) = map else {
@@ -665,6 +680,7 @@ impl Game {
 
                         events: events_pool.new(),
                         map_votes_loaded: Default::default(),
+                        misc_votes_loaded: Default::default(),
 
                         render_players_pool: Pool::with_capacity(64),
                         render_observers_pool: Pool::with_capacity(2),
@@ -750,6 +766,18 @@ impl Game {
                     });
                     game_server_info.fill_server_options(info.server_options.clone());
                     pipe.spatial_chat.spatial_chat.support(info.spatial_chat);
+
+                    let mut local_player_id_counter = 0;
+
+                    let mut expected_local_players: FxLinkedHashMap<u64, ClientConnectedPlayer> =
+                        Default::default();
+                    expected_local_players.insert(
+                        local_player_id_counter,
+                        ClientConnectedPlayer::Connecting { is_dummy: false },
+                    );
+                    let active_local_player_id = local_player_id_counter;
+                    local_player_id_counter += 1;
+
                     let render_props = RenderGameCreateOptions {
                         physics_group_name: info.server_options.physics_group_name,
                         resource_http_download_url: Some(HTTP_RESOURCE_URL.try_into().unwrap()),
@@ -766,19 +794,12 @@ impl Game {
                         fonts: connecting.base.fonts.clone(),
                         sound_props: Default::default(),
                         render_mod: RenderModTy::render_mod(&info.render_mod, pipe.config_game),
+                        client_local_infos: Self::character_net_infos(
+                            &expected_local_players,
+                            pipe.config_game,
+                        ),
                         required_resources: info.required_resources.clone(),
                     };
-
-                    let mut local_player_id_counter = 0;
-
-                    let mut expected_local_players: FxLinkedHashMap<u64, ClientConnectedPlayer> =
-                        Default::default();
-                    expected_local_players.insert(
-                        local_player_id_counter,
-                        ClientConnectedPlayer::Connecting { is_dummy: false },
-                    );
-                    let active_local_player_id = local_player_id_counter;
-                    local_player_id_counter += 1;
 
                     *self = Self::load(
                         connecting.base,
@@ -793,11 +814,13 @@ impl Game {
                         timestamp.saturating_sub(overhead),
                         info.hint_start_camera_pos,
                         pipe.config,
+                        pipe.config_game,
                         connecting.connect,
                         GameStateCreateOptions {
                             hint_max_characters: None, // TODO: get from server
                             config: info.mod_config,
                             account_db: None,
+                            initial_rcon_input: Default::default(),
                         },
                         render_props,
                         info.spatial_chat
@@ -834,24 +857,6 @@ impl Game {
                     });
                     game_server_info.fill_server_options(info.server_options.clone());
                     pipe.spatial_chat.spatial_chat.support(info.spatial_chat);
-                    let render_props = RenderGameCreateOptions {
-                        physics_group_name: info.server_options.physics_group_name,
-                        resource_http_download_url: Some(HTTP_RESOURCE_URL.try_into().unwrap()),
-                        resource_download_server: info.resource_server_fallback.map(|port| {
-                            format!("http://{}", SocketAddr::new(game.connect.addr.ip(), port))
-                                .as_str()
-                                .try_into()
-                                .unwrap()
-                        }),
-                        fonts: game.base.fonts.clone(),
-                        sound_props: Default::default(),
-                        render_mod: RenderModTy::render_mod(&info.render_mod, pipe.config_game),
-                        required_resources: info.required_resources.clone(),
-                    };
-                    game.network.server_connect_time =
-                        timestamp.saturating_sub(game.game_data.prediction_timer.ping_max());
-                    pipe.ui.is_ui_open = true;
-                    pipe.config.ui.path.route("connect");
 
                     let mut expected_local_players = game.game_data.local.expected_local_players;
                     expected_local_players.values_mut().for_each(|p| {
@@ -869,6 +874,29 @@ impl Game {
                     let local_player_id_counter = game.game_data.local.local_player_id_counter;
                     let active_local_player_id = game.game_data.local.active_local_player_id;
 
+                    let render_props = RenderGameCreateOptions {
+                        physics_group_name: info.server_options.physics_group_name,
+                        resource_http_download_url: Some(HTTP_RESOURCE_URL.try_into().unwrap()),
+                        resource_download_server: info.resource_server_fallback.map(|port| {
+                            format!("http://{}", SocketAddr::new(game.connect.addr.ip(), port))
+                                .as_str()
+                                .try_into()
+                                .unwrap()
+                        }),
+                        fonts: game.base.fonts.clone(),
+                        sound_props: Default::default(),
+                        render_mod: RenderModTy::render_mod(&info.render_mod, pipe.config_game),
+                        required_resources: info.required_resources.clone(),
+                        client_local_infos: Self::character_net_infos(
+                            &expected_local_players,
+                            pipe.config_game,
+                        ),
+                    };
+                    game.network.server_connect_time =
+                        timestamp.saturating_sub(game.game_data.prediction_timer.ping_max());
+                    pipe.ui.is_ui_open = true;
+                    pipe.config.ui.path.route("connect");
+
                     *self = Self::load(
                         game.base,
                         game.network,
@@ -882,11 +910,13 @@ impl Game {
                         timestamp,
                         info.hint_start_camera_pos,
                         pipe.config,
+                        pipe.config_game,
                         game.connect,
                         GameStateCreateOptions {
                             hint_max_characters: None, // TODO: get from server
                             config: info.mod_config,
                             account_db: None,
+                            initial_rcon_input: Default::default(),
                         },
                         render_props,
                         info.spatial_chat

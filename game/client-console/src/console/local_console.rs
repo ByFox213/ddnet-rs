@@ -1,8 +1,8 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     net::{SocketAddr, ToSocketAddrs},
     ops::Range,
+    path::PathBuf,
     rc::Rc,
 };
 
@@ -41,10 +41,16 @@ pub enum LocalConsoleEvent {
         // The bind was added to the player's profile
         was_player_profile: bool,
     },
-    /// A unbind command was executed
+    /// An unbind command was executed
     Unbind {
         // The bind was added to the player's profile
         was_player_profile: bool,
+    },
+    Exec {
+        file_path: PathBuf,
+    },
+    Echo {
+        text: String,
     },
     /// Switch to an dummy or the main player
     ChangeDummy {
@@ -55,6 +61,7 @@ pub enum LocalConsoleEvent {
     ConfigVariable {
         name: String,
     },
+    LocalPlayerAction(BindActionsLocalPlayer),
     Quit,
 }
 
@@ -83,18 +90,80 @@ impl super::console::ConsoleEvents<LocalConsoleEvent> for LocalConsoleEvents {
     }
 }
 
-pub type LocalConsole = ConsoleRender<LocalConsoleEvent, ()>;
+pub type LocalConsole = ConsoleRender<LocalConsoleEvent, Rc<ParserCache>>;
 
-#[derive(Debug, Default)]
-pub struct LocalConsoleBuilder {}
+#[derive(Debug)]
+pub struct LocalConsoleBuilder {
+    pub entries: Vec<ConsoleEntry>,
+    pub console_events: LocalConsoleEvents,
+    pub parser_cache: Rc<ParserCache>,
+}
+
+impl Default for LocalConsoleBuilder {
+    fn default() -> Self {
+        let console_events: LocalConsoleEvents = Default::default();
+        let mut entries: Vec<ConsoleEntry> = Vec::new();
+
+        let val = ConfigEngine::conf_value();
+        let events_var = console_events.clone();
+        let var_on_set = Rc::new(move |name: &str| {
+            events_var.push(LocalConsoleEvent::ConfigVariable {
+                name: name.to_string(),
+            });
+        });
+        parse_conf_values_as_str_list(
+            "".to_string(),
+            &mut |entry, _| {
+                entries.push(ConsoleEntry::Var(ConsoleEntryVariable {
+                    full_name: entry.name,
+                    usage: entry.usage,
+                    description: entry.description,
+                    args: entry.args,
+                    on_set: var_on_set.clone(),
+                }));
+            },
+            val,
+            "".into(),
+            Default::default(),
+        );
+        let val = ConfigGame::conf_value();
+        parse_conf_values_as_str_list(
+            "".to_string(),
+            &mut |entry, _| {
+                entries.push(ConsoleEntry::Var(ConsoleEntryVariable {
+                    full_name: entry.name,
+                    usage: entry.usage,
+                    description: entry.description,
+                    args: entry.args,
+                    on_set: var_on_set.clone(),
+                }));
+            },
+            val,
+            "".into(),
+            Default::default(),
+        );
+        let parser_cache = Rc::new(ParserCache::default());
+        Self::register_commands(console_events.clone(), &mut entries, parser_cache.clone());
+
+        Self {
+            console_events,
+            entries,
+            parser_cache,
+        }
+    }
+}
 
 impl LocalConsoleBuilder {
-    fn register_commands(console_events: LocalConsoleEvents, list: &mut Vec<ConsoleEntry>) {
+    fn register_commands(
+        console_events: LocalConsoleEvents,
+        list: &mut Vec<ConsoleEntry>,
+        parser_cache: Rc<ParserCache>,
+    ) {
         list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
             name: "push".into(),
             usage: "push <var>".into(),
             description: "Push a new item to a config variable of type array.".into(),
-            cmd: Rc::new(|config_engine, config_game, path| {
+            cmd: Rc::new(|config_engine, config_game, _, path| {
                 let path = syn_vec_to_config_val(path).unwrap_or_default();
                 if config_engine
                     .try_set_from_str(path.clone(), None, None, None, ConfigFromStrOperation::Push)
@@ -123,7 +192,7 @@ impl LocalConsoleBuilder {
             name: "pop".into(),
             usage: "pop <var>".into(),
             description: "Pop the last item of a config variable of type array.".into(),
-            cmd: Rc::new(|config_engine, config_game, path| {
+            cmd: Rc::new(|config_engine, config_game, _, path| {
                 let path = syn_vec_to_config_val(path).unwrap_or_default();
                 if config_engine
                     .try_set_from_str(path.clone(), None, None, None, ConfigFromStrOperation::Pop)
@@ -152,7 +221,7 @@ impl LocalConsoleBuilder {
             name: "rem".into(),
             usage: "rem <var>[key]".into(),
             description: "Remove an item from a config variable of type object.".into(),
-            cmd: Rc::new(|config_engine, config_game, path| {
+            cmd: Rc::new(|config_engine, config_game, _, path| {
                 let path = syn_vec_to_config_val(path).unwrap_or_default();
                 if config_engine
                     .try_set_from_str(path.clone(), None, None, None, ConfigFromStrOperation::Rem)
@@ -181,7 +250,7 @@ impl LocalConsoleBuilder {
             name: "reset".into(),
             usage: "reset <var>".into(),
             description: "Reset the value of a config variable to its default.".into(),
-            cmd: Rc::new(|config_engine, config_game, path| {
+            cmd: Rc::new(|config_engine, config_game, _, path| {
                 let path = syn_vec_to_config_val(path).unwrap_or_default();
                 if path.is_empty() {
                     return Err(anyhow::anyhow!("You cannot reset the whole config at once"));
@@ -274,7 +343,7 @@ impl LocalConsoleBuilder {
             name: "toggle".into(),
             usage: "toggle <var> <arg> <arg>".into(),
             description: "Toggle a config variable between two args.".into(),
-            cmd: Rc::new(|config_engine, config_game, path| {
+            cmd: Rc::new(|config_engine, config_game, _, path| {
                 toggle(config_engine, config_game, path)
             }),
             args: vec![CommandArg {
@@ -289,7 +358,7 @@ impl LocalConsoleBuilder {
             description:
                 "Toggle a config variable between two args until the pressed key is released again."
                     .into(),
-            cmd: Rc::new(|config_engine, config_game, path| {
+            cmd: Rc::new(|config_engine, config_game, _, path| {
                 toggle(config_engine, config_game, path)
             }),
             args: vec![CommandArg {
@@ -302,12 +371,16 @@ impl LocalConsoleBuilder {
         let actions_map = gen_local_player_action_hash_map();
         let actions_map_rev = gen_local_player_action_hash_map_rev();
 
-        for name in actions_map.keys() {
+        for (name, &action) in actions_map.iter() {
+            let events = console_events.clone();
             list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
                 name: name.to_string(),
                 usage: format!("triggers a player action: {}", name),
                 description: format!("Triggers the player action: {}", name),
-                cmd: Rc::new(move |_config_engine, _config_game, _path| Ok(String::default())),
+                cmd: Rc::new(move |_config_engine, _config_game, _, _path| {
+                    events.push(LocalConsoleEvent::LocalPlayerAction(action));
+                    Ok(String::default())
+                }),
                 args: vec![],
                 allows_partial_cmds: false,
             }));
@@ -317,6 +390,8 @@ impl LocalConsoleBuilder {
             ty: CommandArgType::TextArrayFrom {
                 from: {
                     let mut res = vec![];
+
+                    // keyboard
                     for i in 'a'..='z' {
                         res.push(i.to_string());
                     }
@@ -334,6 +409,8 @@ impl LocalConsoleBuilder {
                     res.push("numpad_add".to_string());
                     res.push("numpad_multiply".to_string());
                     res.push("numpad_divide".to_string());
+                    res.push("numpad_comma".to_string());
+                    res.push("numpad_enter".to_string());
 
                     for i in 0..=9 {
                         res.push(format!("digit{}", i));
@@ -347,9 +424,16 @@ impl LocalConsoleBuilder {
 
                     res.push("pause".to_string());
 
-                    res.push("left".to_string());
-                    res.push("right".to_string());
-                    res.push("middle".to_string());
+                    res.push("equal".to_string());
+                    res.push("minus".to_string());
+                    res.push("period".to_string());
+                    res.push("quote".to_string());
+                    res.push("semicolon".to_string());
+                    res.push("slash".to_string());
+
+                    res.push("backspace".to_string());
+
+                    res.push("caps_lock".to_string());
 
                     res.push("arrow_left".to_string());
                     res.push("arrow_right".to_string());
@@ -365,12 +449,42 @@ impl LocalConsoleBuilder {
                     res.push("alt_left".to_string());
                     res.push("alt_right".to_string());
 
+                    res.push("print_screen".to_string());
+
+                    // TODO: are these useful?
+                    // res.push("context_menu".to_string());
+                    // res.push("super_left".to_string());
+                    // res.push("super_right".to_string());
+                    // res.push("num_lock".to_string());
+
                     res.push("space".to_string());
                     res.push("tab".to_string());
 
+                    res.push("delete".to_string());
+                    res.push("end".to_string());
+
+                    res.push("home".to_string());
+                    res.push("insert".to_string());
+
+                    res.push("backquote".to_string());
+                    res.push("backslash".to_string());
+
+                    res.push("bracket_left".to_string());
+                    res.push("bracket_right".to_string());
+
+                    res.push("comma".to_string());
+
+                    // mouse
+                    res.push("mouse_left".to_string());
+                    res.push("mouse_right".to_string());
+                    res.push("mouse_middle".to_string());
+                    res.push("mouse_back".to_string());
+                    res.push("mouse_forward".to_string());
+
+                    // mouse wheel
                     res.push("wheel_down".to_string());
                     res.push("wheel_up".to_string());
-                    // TODO: add lot more
+
                     res.into_iter().map(|s| s.try_into().unwrap()).collect()
                 },
                 separator: '+',
@@ -380,7 +494,7 @@ impl LocalConsoleBuilder {
 
         fn str_to_bind_keys_lossy(
             keys_arg: &CommandArg,
-            cache: &RefCell<ParserCache>,
+            cache: &ParserCache,
             bind: &str,
         ) -> Vec<Vec<BindKey>> {
             let cmds = parser::parse(
@@ -389,11 +503,11 @@ impl LocalConsoleBuilder {
                     name: "bind".to_string(),
                     usage: "dummy".to_string(),
                     description: "dummy".to_string(),
-                    cmd: Rc::new(|_, _, _| Ok("".into())),
+                    cmd: Rc::new(|_, _, _, _| Ok("".into())),
                     args: vec![keys_arg.clone()],
                     allows_partial_cmds: false,
                 })]),
-                &mut cache.borrow_mut(),
+                cache,
             );
 
             let mut res: Vec<_> = Default::default();
@@ -423,7 +537,7 @@ impl LocalConsoleBuilder {
             config_game: &mut ConfigGame,
             path: &[(Syn, Range<usize>)],
             keys_arg: &CommandArg,
-            cache: &RefCell<ParserCache>,
+            cache: &ParserCache,
             events: &LocalConsoleEvents,
         ) -> anyhow::Result<Vec<String>> {
             let mut keys = syn_to_bind_keys(&mut path.iter())?;
@@ -474,7 +588,7 @@ impl LocalConsoleBuilder {
             config_game: &mut ConfigGame,
             path: &[(Syn, Range<usize>)],
             keys_arg: &CommandArg,
-            cache: &RefCell<ParserCache>,
+            cache: &ParserCache,
             actions_map: &HashMap<&'static str, BindActionsLocalPlayer>,
             actions_map_rev: &HashMap<BindActionsLocalPlayer, &'static str>,
             events: &LocalConsoleEvents,
@@ -512,14 +626,13 @@ impl LocalConsoleBuilder {
         }
         // bind for player
         let events = console_events.clone();
-        let cache_shared = Rc::new(RefCell::new(ParserCache::default()));
-        let cache = cache_shared.clone();
+        let cache = parser_cache.clone();
         let keys_arg_cmd = keys_arg.clone();
         list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
             name: "bind".into(),
             usage: "bind <keys> <commands>".into(),
             description: "Binds commands to a single key or key chain.".into(),
-            cmd: Rc::new(move |_config_engine, config_game, path| {
+            cmd: Rc::new(move |_config_engine, config_game, _, path| {
                 bind(
                     config_game.profiles.main as usize,
                     false,
@@ -545,14 +658,14 @@ impl LocalConsoleBuilder {
         let actions_map = gen_local_player_action_hash_map();
         let actions_map_rev = gen_local_player_action_hash_map_rev();
         let events = console_events.clone();
-        let cache = cache_shared.clone();
+        let cache = parser_cache.clone();
         let keys_arg_cmd = keys_arg.clone();
         list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
             name: "bind_dummy".into(),
             usage: "bind_dummy <keys> <commands>".into(),
             description: "Binds commands to a single key or key chain for the dummy profile."
                 .into(),
-            cmd: Rc::new(move |_config_engine, config_game, path| {
+            cmd: Rc::new(move |_config_engine, config_game, _, path| {
                 bind(
                     config_game.profiles.dummy.index as usize,
                     true,
@@ -577,13 +690,13 @@ impl LocalConsoleBuilder {
 
         let keys_arg_cmd = keys_arg.clone();
         // unbind for player
-        let cache = cache_shared.clone();
+        let cache = parser_cache.clone();
         let events = console_events.clone();
         list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
             name: "unbind".into(),
             usage: "unbind <keys>".into(),
             description: "Unbinds commands from a single key or key chain.".into(),
-            cmd: Rc::new(move |_config_engine, config_game, path| {
+            cmd: Rc::new(move |_config_engine, config_game, _, path| {
                 unbind(
                     config_game.profiles.main as usize,
                     false,
@@ -599,14 +712,14 @@ impl LocalConsoleBuilder {
             allows_partial_cmds: false,
         }));
         let keys_arg_cmd = keys_arg.clone();
-        let cache = cache_shared.clone();
+        let cache = parser_cache.clone();
         let events = console_events.clone();
         list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
             name: "unbind_dummy".into(),
             usage: "unbind_dummy <keys>".into(),
             description: "Unbinds commands from a single key or key chain for the dummy profile."
                 .into(),
-            cmd: Rc::new(move |_config_engine, config_game, path| {
+            cmd: Rc::new(move |_config_engine, config_game, _, path| {
                 unbind(
                     config_game.profiles.dummy.index as usize,
                     true,
@@ -624,10 +737,50 @@ impl LocalConsoleBuilder {
 
         let console_events_cmd = console_events.clone();
         list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
+            name: "exec".into(),
+            usage: "exec <file_path>".into(),
+            description: "Executes a file of command lines.".into(),
+            cmd: Rc::new(move |_, _, _, path| {
+                let Syn::Text(file_path_str) = &path[0].0 else {
+                    panic!("Command parser returned a non requested command arg");
+                };
+                let file_path: PathBuf = file_path_str.into();
+                console_events_cmd.push(LocalConsoleEvent::Exec { file_path });
+                Ok("".into())
+            }),
+            args: vec![CommandArg {
+                ty: CommandArgType::Text,
+                user_ty: None,
+            }],
+            allows_partial_cmds: false,
+        }));
+
+        let console_events_cmd = console_events.clone();
+        list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
+            name: "echo".into(),
+            usage: "echo <text>".into(),
+            description: "Echos text to the console and a client component.".into(),
+            cmd: Rc::new(move |_, _, _, path| {
+                let Syn::Text(text) = &path[0].0 else {
+                    panic!("Command parser returned a non requested command arg");
+                };
+
+                console_events_cmd.push(LocalConsoleEvent::Echo { text: text.clone() });
+                Ok(format!("Echo: {text}"))
+            }),
+            args: vec![CommandArg {
+                ty: CommandArgType::Text,
+                user_ty: None,
+            }],
+            allows_partial_cmds: false,
+        }));
+
+        let console_events_cmd = console_events.clone();
+        list.push(ConsoleEntry::Cmd(ConsoleEntryCmd {
             name: "connect".into(),
             usage: "connect <ip:port>".into(),
             description: "Connects to a server of the given ip & port.".into(),
-            cmd: Rc::new(move |_, _, path| {
+            cmd: Rc::new(move |_, _, _, path| {
                 let (Syn::Text(text), _) = path
                     .first()
                     .ok_or_else(|| anyhow!("expected ip & port, but found nothing"))?
@@ -658,7 +811,7 @@ impl LocalConsoleBuilder {
             name: "change_dummy".into(),
             usage: "change_dummy <index>".into(),
             description: "Switches to a dummy, or the main player (index 0).".into(),
-            cmd: Rc::new(move |_, _, path| {
+            cmd: Rc::new(move |_, _, _, path| {
                 let (Syn::Number(index), _) = path
                     .first()
                     .ok_or_else(|| anyhow!("expected an index, but found nothing"))?
@@ -687,7 +840,7 @@ impl LocalConsoleBuilder {
             name: "toggle_dummy".into(),
             usage: "toggle_dummy".into(),
             description: "Toggles between a dummy and the main player.".into(),
-            cmd: Rc::new(move |_, _, _| {
+            cmd: Rc::new(move |_, _, _, _| {
                 console_events_cmd.push(LocalConsoleEvent::ToggleDummy);
                 Ok("".to_string())
             }),
@@ -699,7 +852,7 @@ impl LocalConsoleBuilder {
             name: "quit".into(),
             usage: "quit the client".into(),
             description: "Closes the client.".into(),
-            cmd: Rc::new(move |_, _, _| {
+            cmd: Rc::new(move |_, _, _, _| {
                 console_events.push(LocalConsoleEvent::Quit);
                 Ok("Bye bye".to_string())
             }),
@@ -708,54 +861,13 @@ impl LocalConsoleBuilder {
         }));
     }
 
-    pub fn build(creator: &UiCreator) -> LocalConsole {
-        let console_events: LocalConsoleEvents = Default::default();
-        let mut entries: Vec<ConsoleEntry> = Vec::new();
-        let val = ConfigEngine::conf_value();
-        let events_var = console_events.clone();
-        let var_on_set = Rc::new(move |name: &str| {
-            events_var.push(LocalConsoleEvent::ConfigVariable {
-                name: name.to_string(),
-            });
-        });
-        parse_conf_values_as_str_list(
-            "".to_string(),
-            &mut |entry, _| {
-                entries.push(ConsoleEntry::Var(ConsoleEntryVariable {
-                    full_name: entry.name,
-                    usage: entry.usage,
-                    description: entry.description,
-                    args: entry.args,
-                    on_set: var_on_set.clone(),
-                }));
-            },
-            val,
-            "".into(),
-            Default::default(),
-        );
-        let val = ConfigGame::conf_value();
-        parse_conf_values_as_str_list(
-            "".to_string(),
-            &mut |entry, _| {
-                entries.push(ConsoleEntry::Var(ConsoleEntryVariable {
-                    full_name: entry.name,
-                    usage: entry.usage,
-                    description: entry.description,
-                    args: entry.args,
-                    on_set: var_on_set.clone(),
-                }));
-            },
-            val,
-            "".into(),
-            Default::default(),
-        );
-        Self::register_commands(console_events.clone(), &mut entries);
+    pub fn build(self, creator: &UiCreator) -> LocalConsole {
         ConsoleRender::new(
             creator,
-            entries,
-            Box::new(console_events),
+            self.entries,
+            Box::new(self.console_events),
             Color32::from_rgba_unmultiplied(0, 0, 0, 150),
-            (),
+            self.parser_cache,
         )
     }
 }

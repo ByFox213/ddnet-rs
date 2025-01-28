@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     fmt::Display,
     ops::{Deref, Range},
@@ -280,13 +281,15 @@ impl TokenStack {
     }
 }
 
+type ParseIdentResult =
+    anyhow::Result<(String, Range<usize>), Option<(anyhow::Error, Range<usize>)>>;
 fn parse_command_ident<const S: usize>(
     tokens: &mut TokenStack,
     commands: &HashMap<NetworkString<S>, Vec<CommandArg>>,
-) -> anyhow::Result<(String, Range<usize>), Option<Range<usize>>> {
+) -> ParseIdentResult {
     if let Some((token, text, range)) = tokens.peek() {
         let res = if let Token::Quoted = token {
-            let text = unescape(text).map_err(|_| Some(range.clone()))?;
+            let text = unescape(text).map_err(|err| Some((err.into(), range.clone())))?;
 
             Ok(text)
         } else if let Token::Text = token {
@@ -308,7 +311,7 @@ fn parse_command_ident<const S: usize>(
                 Err(anyhow!("Found text was not a command ident"))
             }
         })
-        .map_err(|_| Some(range))
+        .map_err(|err| Some((err, range)))
     } else {
         Err(None)
     }
@@ -503,8 +506,8 @@ fn parse_raw_non_empty(
 /// The result of parsing a command.
 #[derive(Error, Debug, Serialize, Deserialize)]
 pub enum CommandParseResult {
-    #[error("Expected a command name")]
-    InvalidCommandIdent(Range<usize>),
+    #[error("Expected a command name, found: {err}")]
+    InvalidCommandIdent { range: Range<usize>, err: String },
     #[error("{err}")]
     InvalidArg {
         arg_index: usize,
@@ -537,7 +540,7 @@ pub enum CommandParseResult {
 impl CommandParseResult {
     pub fn range(&self) -> &Range<usize> {
         match self {
-            CommandParseResult::InvalidCommandIdent(range)
+            CommandParseResult::InvalidCommandIdent { range, .. }
             | CommandParseResult::InvalidArg { range, .. }
             | CommandParseResult::InvalidCommandArg { range, .. }
             | CommandParseResult::InvalidCommandsArg { range, .. }
@@ -650,8 +653,13 @@ fn parse_command<const S: usize>(
                     parse_command_ident(tokens, commands)
                         .map(|(s, range)| SynOrErr::Syn((Syn::Text(s), range)))
                         .unwrap_or_else(|range_err| {
-                            let range = range_err.unwrap_or_else(|| range.clone());
-                            SynOrErr::ParseRes(CommandParseResult::InvalidCommandIdent(range))
+                            let (err, range) = range_err.unwrap_or_else(|| {
+                                (anyhow!("No text was given"), range.end + 1..range.end + 2)
+                            });
+                            SynOrErr::ParseRes(CommandParseResult::InvalidCommandIdent {
+                                range,
+                                err: err.to_string(),
+                            })
                         }),
                 ),
                 CommandArgType::Commands => {
@@ -672,11 +680,14 @@ fn parse_command<const S: usize>(
                         }
                     }
                     if cmds.is_empty() {
-                        return Some(SynOrErr::ParseRes(CommandParseResult::InvalidCommandIdent(
-                            tokens
-                                .cur_stack_end_range_plus_one()
-                                .unwrap_or_else(|| range.end + 1..range.end + 2),
-                        )));
+                        return Some(SynOrErr::ParseRes(
+                            CommandParseResult::InvalidCommandIdent {
+                                range: tokens
+                                    .cur_stack_end_range_plus_one()
+                                    .unwrap_or_else(|| range.end + 1..range.end + 2),
+                                err: "No text was given".to_string(),
+                            },
+                        ));
                     }
                     let range = cmds
                         .first()
@@ -844,16 +855,18 @@ fn parse_command<const S: usize>(
         tokens.can_pop();
         Ok(cmd)
     } else {
-        let peek_token = tokens.next_token().map(|(_, _, range)| range);
-        let res = Err(CommandParseResult::InvalidCommandIdent(
-            if let Some(range) = peek_token {
-                range
-            } else {
+        let peek_token = tokens.next_token().map(|(_, text, range)| (text, range));
+        let (err, range) = if let Some((text, range)) = peek_token {
+            (text, range)
+        } else {
+            (
+                "No text was given".to_string(),
                 tokens
                     .cur_stack_end_range_plus_one()
-                    .unwrap_or_else(|| (0..0))
-            },
-        ));
+                    .unwrap_or_else(|| (0..0)),
+            )
+        };
+        let res = Err(CommandParseResult::InvalidCommandIdent { range, err });
 
         tokens.can_pop();
         res
@@ -899,17 +912,16 @@ fn generate_token_stack_entries(
 /// Creating this cache is free.
 #[derive(Debug, Default)]
 pub struct ParserCache {
-    reg: Option<regex::Regex>,
+    reg: RefCell<Option<regex::Regex>>,
 }
 
 pub fn parse<const S: usize>(
     raw: &str,
     commands: &HashMap<NetworkString<S>, Vec<CommandArg>>,
-    state: &mut ParserCache,
+    state: &ParserCache,
 ) -> CommandsTyped {
-    let reg = state
-        .reg
-        .get_or_insert_with(|| regex::Regex::new(r"\[([^\]]+)\]").unwrap());
+    let mut reg = state.reg.borrow_mut();
+    let reg = reg.get_or_insert_with(|| regex::Regex::new(r"\[([^\]]+)\]").unwrap());
 
     let (tokens, token_err) = tokenize(raw)
         .map(|tokens| (tokens, None))
@@ -944,7 +956,7 @@ pub fn parse<const S: usize>(
                     *range = err_range;
                     *err = err_token().to_string();
                 }
-                CommandParseResult::InvalidCommandIdent(_)
+                CommandParseResult::InvalidCommandIdent { .. }
                 | CommandParseResult::InvalidCommandArg { .. }
                 | CommandParseResult::InvalidCommandsArg { .. }
                 | CommandParseResult::InvalidQuoteParsing(_)
@@ -968,7 +980,7 @@ mod test {
 
     #[test]
     fn console_tests() {
-        let mut cache = ParserCache::default();
+        let cache = ParserCache::default();
         let lex = parse::<65536>(
             "cl.map \"name with\\\" spaces\"",
             &vec![(
@@ -980,7 +992,7 @@ mod test {
             )]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1012,7 +1024,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1048,7 +1060,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1091,7 +1103,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1112,7 +1124,7 @@ mod test {
             )]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1135,7 +1147,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1161,7 +1173,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1196,7 +1208,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1223,7 +1235,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1253,7 +1265,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1263,7 +1275,7 @@ mod test {
 
     #[test]
     fn console_test_index() {
-        let mut cache = ParserCache::default();
+        let cache = ParserCache::default();
         let lex = parse::<65536>(
             "players[0] something",
             &vec![(
@@ -1275,7 +1287,7 @@ mod test {
             )]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
         dbg!(&lex);
         assert!(lex[0].unwrap_ref_full().args[0].0 == Syn::Text("something".to_string()));
@@ -1285,7 +1297,7 @@ mod test {
             &vec![("players$INDEX$".try_into().unwrap(), vec![])]
                 .into_iter()
                 .collect(),
-            &mut cache,
+            &cache,
         );
         dbg!(&lex);
         assert!(matches!(lex[0], CommandType::Full(_)));
@@ -1301,7 +1313,7 @@ mod test {
             )]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1310,7 +1322,7 @@ mod test {
 
     #[test]
     fn err_console_tests() {
-        let mut cache = ParserCache::default();
+        let cache = ParserCache::default();
         let lex = parse::<65536>(
             "cl.map \"name with\\\" ",
             &vec![(
@@ -1322,7 +1334,7 @@ mod test {
             )]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1352,7 +1364,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1385,7 +1397,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1421,7 +1433,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1454,7 +1466,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1490,7 +1502,7 @@ mod test {
             ]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);
@@ -1507,7 +1519,7 @@ mod test {
             )]
             .into_iter()
             .collect(),
-            &mut cache,
+            &cache,
         );
 
         dbg!(&lex);

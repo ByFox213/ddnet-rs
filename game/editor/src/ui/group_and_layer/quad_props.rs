@@ -10,7 +10,9 @@ use time::Duration;
 use ui_base::types::{UiRenderPipe, UiState};
 
 use crate::{
-    actions::actions::{ActChangeQuadAttr, EditorAction},
+    actions::actions::{
+        ActChangeQuadAttr, ActQuadLayerAddRemQuads, ActQuadLayerRemQuads, EditorAction,
+    },
     explain::TEXT_QUAD_PROP_COLOR,
     map::{EditorAnimations, EditorLayer, EditorLayerUnionRefMut, EditorMapGroupsInterface},
     tools::{
@@ -114,7 +116,8 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
             animations_panel_open: bool,
             animations: &EditorAnimations,
             pointer_is_used: &mut bool,
-        ) -> InnerResponse<()> {
+        ) -> InnerResponse<bool> {
+            let mut delete = false;
             egui::Grid::new("design group attr grid")
                 .num_columns(2)
                 .spacing([20.0, 4.0])
@@ -132,7 +135,10 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             // x
                             ui.label("move x by");
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut pos_offset.x));
+                                ui.add(
+                                    egui::DragValue::new(&mut pos_offset.x)
+                                        .update_while_editing(false),
+                                );
                                 if ui.button("move").clicked() {
                                     if let Some(pos_anim) = &mut anim_pos {
                                         pos_anim.value.x = ffixed::from_num(pos_offset.x);
@@ -147,7 +153,10 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             // y
                             ui.label("move y by");
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut pos_offset.y));
+                                ui.add(
+                                    egui::DragValue::new(&mut pos_offset.y)
+                                        .update_while_editing(false),
+                                );
                                 if ui.button("move").clicked() {
                                     if let Some(pos_anim) = anim_pos {
                                         pos_anim.value.y = ffixed::from_num(pos_offset.y);
@@ -163,13 +172,13 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             // x
                             ui.label("x");
                             let mut x = quad.points[p].x.to_num::<f64>();
-                            ui.add(egui::DragValue::new(&mut x));
+                            ui.add(egui::DragValue::new(&mut x).update_while_editing(false));
                             quad.points[p].x = ffixed::from_num(x);
                             ui.end_row();
                             // y
                             ui.label("y");
                             let mut y = quad.points[p].y.to_num::<f64>();
-                            ui.add(egui::DragValue::new(&mut y));
+                            ui.add(egui::DragValue::new(&mut y).update_while_editing(false));
                             quad.points[p].y = ffixed::from_num(y);
                             ui.end_row();
                         }
@@ -235,7 +244,10 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             // pos time offset
                             ui.label("pos anim time offset");
                             let mut millis = quad.pos_anim_offset.whole_milliseconds() as i64;
-                            if ui.add(egui::DragValue::new(&mut millis)).changed() {
+                            if ui
+                                .add(egui::DragValue::new(&mut millis).update_while_editing(false))
+                                .changed()
+                            {
                                 quad.pos_anim_offset = Duration::milliseconds(millis);
                             }
                             ui.end_row();
@@ -294,14 +306,17 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             // color time offset
                             ui.label("color anim time offset");
                             let mut millis = quad.color_anim_offset.whole_milliseconds() as i64;
-                            if ui.add(egui::DragValue::new(&mut millis)).changed() {
+                            if ui
+                                .add(egui::DragValue::new(&mut millis).update_while_editing(false))
+                                .changed()
+                            {
                                 quad.color_anim_offset = Duration::milliseconds(millis);
                             }
                             ui.end_row();
                         }
 
                         // square
-                        if ui.button("square").clicked() {
+                        if ui.button("Square").clicked() {
                             let mut min = quad.points[0];
                             let mut max = quad.points[0];
 
@@ -316,6 +331,11 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             quad.points[1] = vec2_base::new(max.x, min.y);
                             quad.points[2] = vec2_base::new(min.x, max.y);
                             quad.points[3] = max;
+                        }
+                        ui.end_row();
+
+                        if ui.button("Delete").clicked() {
+                            delete = true;
                         }
                         ui.end_row();
                     } else if let QuadPointerDownPoint::Corner(c) = point {
@@ -377,13 +397,14 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                         .on_hover_ui(animations_panel_open_warning);
                         ui.end_row();
                     }
+                    delete
                 })
         }
 
         let window_res = match attr_mode {
             QuadAttrMode::Single => {
                 let (index, quad) = selected_quads.pop_first().unwrap();
-                let quad_cmp = quad.clone();
+                let quad_cmp = *quad;
 
                 let window = egui::Window::new("Design Quad Attributes")
                     .resizable(false)
@@ -406,6 +427,10 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                     )
                 });
 
+                let delete = window_res
+                    .as_ref()
+                    .is_some_and(|r| r.inner.as_ref().is_some_and(|r| r.inner));
+
                 if *quad != quad_cmp && !animations_panel_open {
                     let layer_quad = &layer.layer.quads[index];
                     pipe.user_data.editor_tab.client.execute(
@@ -413,13 +438,28 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             is_background,
                             group_index,
                             layer_index,
-                            old_attr: layer_quad.clone(),
-                            new_attr: quad.clone(),
+                            old_attr: *layer_quad,
+                            new_attr: *quad,
 
                             index,
                         })),
                         Some(&format!(
                             "change-quad-attr-{is_background}-{group_index}-{layer_index}-{index}"
+                        )),
+                    );
+                } else if delete {
+                    pipe.user_data.editor_tab.client.execute(
+                        EditorAction::QuadLayerRemQuads(ActQuadLayerRemQuads {
+                            base: ActQuadLayerAddRemQuads {
+                                is_background,
+                                group_index,
+                                layer_index,
+                                index,
+                                quads: vec![*quad],
+                            },
+                        }),
+                        Some(&format!(
+                            "quad-rem-design-{is_background}-{group_index}-{layer_index}-{index}"
                         )),
                     );
                 }
@@ -431,9 +471,9 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                     .iter_mut()
                     .peekable()
                     .next()
-                    .map(|(i, q)| (*i, q.clone()))
+                    .map(|(i, q)| (*i, **q))
                     .unwrap();
-                let quad_cmp = quad.clone();
+                let quad_cmp = quad;
 
                 let mut selected_quads: Vec<_> = selected_quads.into_iter().collect();
                 let can_change_pos_anim = selected_quads
@@ -463,6 +503,10 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                         pipe.user_data.pointer_is_used,
                     )
                 });
+
+                let delete = window_res
+                    .as_ref()
+                    .is_some_and(|r| r.inner.as_ref().is_some_and(|r| r.inner));
 
                 if quad != quad_cmp {
                     let prop_quad = quad;
@@ -524,8 +568,8 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                                     is_background,
                                     group_index,
                                     layer_index,
-                                    old_attr: layer_quad.clone(),
-                                    new_attr: quad.clone(),
+                                    old_attr: *layer_quad,
+                                    new_attr: **quad,
 
                                     index,
                                 })),
@@ -535,6 +579,34 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                             );
                         }
                     });
+                } else if delete {
+                    // rewrite the quad indices, since they get invalid every time a quad is deleted.
+                    for i in 0..selected_quads.len() {
+                        let (delete_index, _) = selected_quads[i];
+                        for (index, _) in selected_quads.iter_mut().skip(i + 1) {
+                            if *index > delete_index {
+                                *index = index.saturating_sub(1);
+                            }
+                        }
+                    }
+
+                    for (index, quad) in selected_quads {
+                        pipe.user_data.editor_tab.client.execute(
+                            EditorAction::QuadLayerRemQuads(ActQuadLayerRemQuads {
+                                base: ActQuadLayerAddRemQuads {
+                                    is_background,
+                                    group_index,
+                                    layer_index,
+                                    index,
+                                    quads: vec![*quad],
+                                },
+                            }),
+                            Some(&format!(
+                                "quad-rem-design-{is_background}-\
+                                {group_index}-{layer_index}-{index}"
+                            )),
+                        );
+                    }
                 }
 
                 window_res
@@ -564,7 +636,9 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
                     None
                 }
             });
-            if intersected.is_some_and(|(outside, clicked)| outside && clicked) {
+            if intersected.is_some_and(|(outside, clicked)| outside && clicked)
+                && !ui.memory(|i| i.any_popup_open())
+            {
                 match &pipe.user_data.tools.active_tool {
                     ActiveTool::Quads(ActiveToolQuads::Brush) => {
                         pipe.user_data.tools.quads.brush.last_selection = None;

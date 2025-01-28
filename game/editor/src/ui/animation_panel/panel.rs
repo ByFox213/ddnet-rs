@@ -32,7 +32,7 @@ pub fn render(ui: &mut egui::Ui, pipe: &mut UiRenderPipe<UserDataWithTab>, ui_st
         let mut panel = egui::TopBottomPanel::bottom("animations_panel")
             .resizable(true)
             .height_range(300.0..=600.0);
-        panel = panel.default_height(200.0);
+        panel = panel.default_height(300.0);
 
         // if anim panel is open, and quads/sounds are selected
         // they basically automatically select their active animations
@@ -302,10 +302,10 @@ fn handle_point_insert(pipe: &mut UiRenderPipe<UserDataWithTab>) {
         &tools.active_tool,
         &mut tools.quads.selection,
     ) {
-        fn add_or_insert<P: Clone + DeserializeOwned>(
+        fn add_or_insert<P: Clone + DeserializeOwned, const CHANNELS: usize>(
             cur_time: Duration,
-            anim: &mut AnimBaseSkeleton<EditorAnimationProps, AnimPoint<P>>,
-            insert_repl_point: &AnimPoint<P>,
+            anim: &mut AnimBaseSkeleton<EditorAnimationProps, AnimPoint<P, CHANNELS>>,
+            insert_repl_point: &AnimPoint<P, CHANNELS>,
         ) {
             enum ReplOrInsert {
                 Repl(usize),

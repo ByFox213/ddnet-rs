@@ -64,7 +64,7 @@ pub trait EditorDesignLayerInterface {
 #[derive(Debug, Default, Clone)]
 pub struct EditorCommonGroupOrLayerAttr {
     pub hidden: bool,
-    // active layer/group, e.g. a brush on a active tile layer would have effect
+    // active layer/group, e.g. a brush on an active tile layer would have effect
     pub active: bool,
 }
 
@@ -175,7 +175,14 @@ pub struct EditorPhysicsLayerProps {
     /// for physics layers that have numbers that reference other stuff
     /// e.g. tele, switch & tune zone layer
     pub number_extra: FxLinkedHashMap<u8, EditorPhysicsLayerNumberExtra>,
-    pub number_extra_texts: (String, String),
+    pub number_extra_text: String,
+
+    pub switch_delay: u8,
+
+    pub speedup_force: u8,
+    pub speedup_angle: i16,
+    pub speedup_max_speed: u8,
+
     pub context_menu_open: bool,
 }
 
@@ -507,7 +514,12 @@ pub trait EditorMapGroupsInterface {
     fn active_layer_mut(&mut self) -> Option<EditorLayerUnionRefMut>;
 }
 
-pub type EditorConfig = ConfigSkeleton<()>;
+#[derive(Debug, Clone, Default)]
+pub struct EditorMapConfig {
+    pub cmd_string: String,
+    pub selected_cmd: Option<usize>,
+}
+pub type EditorConfig = ConfigSkeleton<EditorMapConfig>;
 pub type EditorMetadata = MetadataSkeleton<()>;
 
 #[derive(Default)]
@@ -536,11 +548,17 @@ pub enum EditorGroupPanelTab {
     Sounds(EditorGroupPanelResources),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EditorChatState {
+    pub msg: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct EditorMapPropsUiValues {
     pub group_panel_active_tab: EditorGroupPanelTab,
     pub animations_panel_open: bool,
     pub server_settings_open: bool,
+    pub chat_panel_open: Option<EditorChatState>,
     pub timeline: Timeline,
 }
 
@@ -550,6 +568,7 @@ impl Default for EditorMapPropsUiValues {
             group_panel_active_tab: EditorGroupPanelTab::GroupsAndLayers,
             animations_panel_open: false,
             server_settings_open: false,
+            chat_panel_open: None,
             timeline: Timeline::new(),
         }
     }
@@ -594,7 +613,7 @@ pub type EditorMap = MapSkeleton<
     EditorArbitraryLayerProps,
     EditorAnimationsProps,
     EditorAnimationProps,
-    (),
+    EditorMapConfig,
     (),
 >;
 
@@ -824,7 +843,7 @@ impl EditorMapInterface for EditorMap {
                     EditorLayer::Tile(layer) => {
                         if layer.user.selected.is_none() {
                             layer.user.selected = Some(EditorTileLayerPropsSelection {
-                                attr: layer.layer.attr.clone(),
+                                attr: layer.layer.attr,
                                 name: layer.layer.name.clone(),
                                 image_2d_array_selection_open: None,
                             });
@@ -835,7 +854,7 @@ impl EditorMapInterface for EditorMap {
                     EditorLayer::Quad(layer) => {
                         if layer.user.selected.is_none() {
                             layer.user.selected = Some(EditorQuadLayerPropsPropsSelection {
-                                attr: layer.layer.attr.clone(),
+                                attr: layer.layer.attr,
                                 name: layer.layer.name.clone(),
                                 image_selection_open: None,
                             });
@@ -846,7 +865,7 @@ impl EditorMapInterface for EditorMap {
                     EditorLayer::Sound(layer) => {
                         if layer.user.selected.is_none() {
                             layer.user.selected = Some(EditorSoundLayerPropsPropsSelection {
-                                attr: layer.layer.attr.clone(),
+                                attr: layer.layer.attr,
                                 name: layer.layer.name.clone(),
                                 sound_selection_open: None,
                             });
@@ -869,7 +888,7 @@ impl EditorMapInterface for EditorMap {
         match set_group {
             EditorMapSetGroup::Physics => {
                 if self.groups.physics.user.selected.is_none() {
-                    self.groups.physics.user.selected = Some(self.groups.physics.attr.clone());
+                    self.groups.physics.user.selected = Some(self.groups.physics.attr);
                 } else {
                     self.groups.physics.user.selected = None;
                 }

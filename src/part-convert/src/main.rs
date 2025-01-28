@@ -35,7 +35,7 @@ fn new_tar() -> TarFile {
 }
 
 fn write_part(write_mode: &mut WriteMode<'_>, part: Particles06Part, output: &Path, name: &str) {
-    let png = image::png::save_png_image(&part.data, part.width, part.height).unwrap();
+    let png = image_utils::png::save_png_image(&part.data, part.width, part.height).unwrap();
     match write_mode {
         WriteMode::Tar(files) => {
             let tar = files
@@ -67,8 +67,8 @@ fn main() {
 
     let file = std::fs::read(args.file).unwrap();
     let mut mem: Vec<u8> = Default::default();
-    let img: image::png::PngResult<'_> =
-        image::png::load_png_image(&file, |width, height, bytes_per_pixel| {
+    let img: image_utils::png::PngResult<'_> =
+        image_utils::png::load_png_image_as_rgba(&file, |width, height, bytes_per_pixel| {
             mem.resize(width * height * bytes_per_pixel, Default::default());
             &mut mem
         })
@@ -85,8 +85,8 @@ fn main() {
 
     std::fs::create_dir_all(args.output.clone()).unwrap();
 
-    write_part(&mut write_mode, converted.slice, &args.output, "slice");
-    write_part(&mut write_mode, converted.ball, &args.output, "ball");
+    write_part(&mut write_mode, converted.slice, &args.output, "slice_001");
+    write_part(&mut write_mode, converted.ball, &args.output, "ball_001");
 
     converted
         .splat
@@ -97,12 +97,12 @@ fn main() {
                 &mut write_mode,
                 splat,
                 &args.output,
-                &format!("splat{index}"),
+                &format!("splat_{:03}", index + 1),
             )
         });
 
-    write_part(&mut write_mode, converted.smoke, &args.output, "smoke");
-    write_part(&mut write_mode, converted.shell, &args.output, "shell");
+    write_part(&mut write_mode, converted.smoke, &args.output, "smoke_001");
+    write_part(&mut write_mode, converted.shell, &args.output, "shell_001");
 
     converted
         .explosion
@@ -113,18 +113,28 @@ fn main() {
                 &mut write_mode,
                 explosion,
                 &args.output,
-                &format!("explosion{index}"),
+                &format!("explosion_{:03}", index + 1),
             )
         });
 
-    write_part(&mut write_mode, converted.airjump, &args.output, "airjump");
+    write_part(
+        &mut write_mode,
+        converted.airjump,
+        &args.output,
+        "airjump_001",
+    );
 
     converted
         .hit
         .into_iter()
         .enumerate()
         .for_each(|(index, hit)| {
-            write_part(&mut write_mode, hit, &args.output, &format!("hit{index}"))
+            write_part(
+                &mut write_mode,
+                hit,
+                &args.output,
+                &format!("hit_{:03}", index + 1),
+            )
         });
 
     for (name, file) in tar_files {

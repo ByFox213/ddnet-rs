@@ -76,6 +76,7 @@ use game_interface::{
     },
     interface::MAX_PHYSICS_GROUP_NAME_LEN,
     types::{
+        character_info::NetworkCharacterInfo,
         flag::FlagType,
         game::GameTickType,
         id_types::{CharacterId, PlayerId, StageId},
@@ -173,6 +174,8 @@ impl RenderModTy {
     }
 }
 
+pub type ClientLocalInfos = Vec<NetworkCharacterInfo>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderGameCreateOptions {
     pub physics_group_name: NetworkReducedAsciiString<MAX_PHYSICS_GROUP_NAME_LEN>,
@@ -189,6 +192,15 @@ pub struct RenderGameCreateOptions {
     /// mod to download & prepare the required resources as soon
     /// as possible, but generally is optional.
     pub required_resources: RequiredResources,
+    /// The initial client local infos.
+    ///
+    /// These don't need to come from the server,
+    /// instead they can be the infos that come from
+    /// the config values.
+    ///
+    /// The implementation can use this information to speed up
+    /// loading of the resources _likely_ to be used.
+    pub client_local_infos: ClientLocalInfos,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -365,6 +377,10 @@ impl RenderGameSettings {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RenderGameInput {
     pub players: PoolFxLinkedHashMap<PlayerId, RenderGameForPlayer>,
+    /// Players currently not controlled by a human player
+    /// (and thus not interesting for rendering).
+    #[doc(alias = "inactive_players")]
+    #[doc(alias = "uncontrolled_players")]
     pub dummies: PoolFxLinkedHashSet<PlayerId>,
     /// The bool indicates if the events were generated on the client (`true`) or
     /// from the server.
@@ -418,6 +434,9 @@ pub struct RenderGame {
     canvas_handle: GraphicsCanvasHandle,
     backend_handle: GraphicsBackendHandle,
 
+    // props
+    client_local_infos: ClientLocalInfos,
+
     // helpers
     helper: Pool<Vec<RenderPlayerHelper>>,
 
@@ -453,7 +472,7 @@ impl RenderGame {
             Some("downloaded".as_ref()),
         ));
 
-        let containers = load_containers(
+        let mut containers = load_containers(
             io,
             thread_pool,
             props.resource_http_download_url,
@@ -464,15 +483,19 @@ impl RenderGame {
             &scene,
         );
 
+        // Use own ui context for nameplates
+        let mut nameplats_creator = UiCreator::default();
+        nameplats_creator.load_font(&props.fonts);
+
+        let players = Players::new(graphics, &nameplats_creator);
+        let render = GameObjectsRender::new(graphics);
+        let cursor_render = RenderCursor::new(graphics);
+        let particles = ParticleManager::new(graphics, cur_time);
+
         let mut creator = UiCreator::default();
         creator.load_font(&props.fonts);
 
-        let players = Players::new(graphics, &creator);
-        let render = GameObjectsRender::new(graphics);
-        let cursor_render = RenderCursor::new(graphics);
         let hud = RenderHud::new(graphics, &creator);
-        let particles = ParticleManager::new(graphics, cur_time);
-
         let chat = ChatRender::new(graphics, &creator);
         let actionfeed = ActionfeedRender::new(graphics, &creator);
         let scoreboard = ScoreboardRender::new(graphics, &creator);
@@ -481,19 +504,28 @@ impl RenderGame {
         let motd = MotdRender::new(graphics, &creator);
         let spectator_selection = SpectatorSelectionRender::new(graphics, &creator);
 
+        let mut map_vote_thumbnails_container = load_thumbnail_container(
+            io.clone(),
+            thread_pool.clone(),
+            DEFAULT_THUMBNAIL_CONTAINER_PATH,
+            "map-votes-thumbnail",
+            graphics,
+            sound,
+            scene.clone(),
+            props.resource_download_server,
+        );
+
+        Self::update_containers_impl(
+            &mut containers,
+            &mut map_vote_thumbnails_container,
+            cur_time,
+            props.client_local_infos.iter(),
+        );
+
         Ok(Self {
             // containers
             containers,
-            map_vote_thumbnails_container: load_thumbnail_container(
-                io.clone(),
-                thread_pool.clone(),
-                DEFAULT_THUMBNAIL_CONTAINER_PATH,
-                "map-votes-thumbnail",
-                graphics,
-                sound,
-                scene.clone(),
-                props.resource_download_server,
-            ),
+            map_vote_thumbnails_container,
 
             // components
             players,
@@ -519,6 +551,8 @@ impl RenderGame {
 
             canvas_handle: graphics.canvas_handle.clone(),
             backend_handle: graphics.backend_handle.clone(),
+
+            client_local_infos: props.client_local_infos,
 
             helper: Pool::with_capacity(1),
 
@@ -1061,7 +1095,7 @@ pub trait RenderGameInterface {
         cur_time: &Duration,
         input: RenderGameInput,
     ) -> RenderGameResult;
-    fn continue_map_loading(&mut self) -> Result<bool, String>;
+    fn continue_loading(&mut self) -> Result<bool, String>;
     fn set_chat_commands(&mut self, chat_commands: ChatCommands);
     /// Clear all rendering state (like particles, sounds etc.)
     fn clear_render_state(&mut self);
@@ -1295,6 +1329,7 @@ impl RenderGame {
                         .weapon_container
                         .get_or_default_opt(info.map(|i| &i.weapon))
                         .gun
+                        .weapon
                         .fire
                         .random_entry(&mut self.rng)
                         .play(
@@ -1534,6 +1569,7 @@ impl RenderGame {
                             .ninja_container
                             .get_or_default_opt(info.map(|i| &i.ninja))
                             .spawn
+                            .random_entry(&mut self.rng)
                             .play(
                                 SoundPlayProps::new_with_pos_opt(pos)
                                     .with_with_spatial(settings.spatial_sound)
@@ -1547,6 +1583,7 @@ impl RenderGame {
                             .ninja_container
                             .get_or_default_opt(info.map(|i| &i.ninja))
                             .collect
+                            .random_entry(&mut self.rng)
                             .play(
                                 SoundPlayProps::new_with_pos_opt(pos)
                                     .with_with_spatial(settings.spatial_sound)
@@ -1653,6 +1690,7 @@ impl RenderGame {
                     .get_or_default_opt(info.map(|i| &i.weapon))
                     .grenade
                     .spawn
+                    .random_entry(&mut self.rng)
                     .play(
                         SoundPlayProps::new_with_pos_opt(pos)
                             .with_with_spatial(settings.spatial_sound)
@@ -1667,6 +1705,7 @@ impl RenderGame {
                     .get_or_default_opt(info.map(|i| &i.weapon))
                     .grenade
                     .collect
+                    .random_entry(&mut self.rng)
                     .play(
                         SoundPlayProps::new_with_pos_opt(pos)
                             .with_with_spatial(settings.spatial_sound)
@@ -1723,6 +1762,7 @@ impl RenderGame {
                     .get_or_default_opt(info.map(|i| &i.weapon))
                     .laser
                     .spawn
+                    .random_entry(&mut self.rng)
                     .play(
                         SoundPlayProps::new_with_pos_opt(pos)
                             .with_with_spatial(settings.spatial_sound)
@@ -1737,6 +1777,7 @@ impl RenderGame {
                     .get_or_default_opt(info.map(|i| &i.weapon))
                     .laser
                     .collect
+                    .random_entry(&mut self.rng)
                     .play(
                         SoundPlayProps::new_with_pos_opt(pos)
                             .with_with_spatial(settings.spatial_sound)
@@ -1779,6 +1820,7 @@ impl RenderGame {
                     .get_or_default_opt(info.map(|i| &i.weapon))
                     .shotgun
                     .spawn
+                    .random_entry(&mut self.rng)
                     .play(
                         SoundPlayProps::new_with_pos_opt(pos)
                             .with_with_spatial(settings.spatial_sound)
@@ -1793,6 +1835,7 @@ impl RenderGame {
                     .get_or_default_opt(info.map(|i| &i.weapon))
                     .shotgun
                     .collect
+                    .random_entry(&mut self.rng)
                     .play(
                         SoundPlayProps::new_with_pos_opt(pos)
                             .with_with_spatial(settings.spatial_sound)
@@ -1904,7 +1947,8 @@ impl RenderGame {
                         .game_container
                         .get_or_default_opt(info.map(|i| &i.game))
                         .heart
-                        .spawn
+                        .spawns
+                        .random_entry(&mut self.rng)
                         .play(
                             SoundPlayProps::new_with_pos_opt(pos)
                                 .with_with_spatial(settings.spatial_sound)
@@ -1935,7 +1979,8 @@ impl RenderGame {
                         .game_container
                         .get_or_default_opt(info.map(|i| &i.game))
                         .shield
-                        .spawn
+                        .spawns
+                        .random_entry(&mut self.rng)
                         .play(
                             SoundPlayProps::new_with_pos_opt(pos)
                                 .with_with_spatial(settings.spatial_sound)
@@ -2405,106 +2450,126 @@ impl RenderGame {
         }
     }
 
-    fn update_containers(
-        &mut self,
+    fn check_required_containers_loaded(&mut self) -> bool {
+        let loaded = self.client_local_infos.iter().all(|i| {
+            self.containers.skin_container.is_loaded_or_failed(&i.skin)
+                && self
+                    .containers
+                    .particles_container
+                    .is_loaded_or_failed(&i.particles)
+        });
+        // since we don't need the property anymore after they are loaded
+        // clear it to save memory & performance.
+        if loaded {
+            self.client_local_infos = Default::default();
+        }
+        loaded
+    }
+
+    fn update_containers_impl<'a, F>(
+        containers: &mut RenderGameContainers,
+        map_vote_thumbnails_container: &mut ThumbnailContainer,
         cur_time: &Duration,
-        character_infos: &PoolFxLinkedHashMap<CharacterId, CharacterInfo>,
-    ) {
-        self.containers.skin_container.update(
+        character_infos: F,
+    ) where
+        F: Iterator<Item = &'a NetworkCharacterInfo> + Clone,
+    {
+        containers.skin_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos.values().map(|info| info.info.skin.borrow()),
+            character_infos.clone().map(|info| info.skin.borrow()),
             None,
         );
-        self.containers.weapon_container.update(
+        containers.weapon_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos
-                .values()
-                .map(|info| info.info.weapon.borrow()),
+            character_infos.clone().map(|info| info.weapon.borrow()),
             None,
         );
-        self.containers.hook_container.update(
+        containers.hook_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos.values().map(|info| info.info.hook.borrow()),
+            character_infos.clone().map(|info| info.hook.borrow()),
             None,
         );
-        self.containers.ctf_container.update(
+        containers.ctf_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos.values().map(|info| info.info.ctf.borrow()),
+            character_infos.clone().map(|info| info.ctf.borrow()),
             None,
         );
-        self.containers.ninja_container.update(
+        containers.ninja_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos
-                .values()
-                .map(|info| info.info.ninja.borrow()),
+            character_infos.clone().map(|info| info.ninja.borrow()),
             None,
         );
-        self.containers.freeze_container.update(
+        containers.freeze_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos
-                .values()
-                .map(|info| info.info.freeze.borrow()),
+            character_infos.clone().map(|info| info.freeze.borrow()),
             None,
         );
-        self.containers.entities_container.update(
+        containers.entities_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos
-                .values()
-                .map(|info| info.info.entities.borrow()),
+            character_infos.clone().map(|info| info.entities.borrow()),
             None,
         );
-        self.containers.hud_container.update(
+        containers.hud_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos.values().map(|info| info.info.hud.borrow()),
+            character_infos.clone().map(|info| info.hud.borrow()),
             None,
         );
-        self.containers.emoticons_container.update(
+        containers.emoticons_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos
-                .values()
-                .map(|info| info.info.emoticons.borrow()),
+            character_infos.clone().map(|info| info.emoticons.borrow()),
             None,
         );
-        self.containers.particles_container.update(
+        containers.particles_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos
-                .values()
-                .map(|info| info.info.particles.borrow()),
+            character_infos.clone().map(|info| info.particles.borrow()),
             None,
         );
-        self.containers.game_container.update(
+        containers.game_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
-            character_infos.values().map(|info| info.info.game.borrow()),
+            character_infos.map(|info| info.game.borrow()),
             None,
         );
-        self.map_vote_thumbnails_container.update(
+        map_vote_thumbnails_container.update(
             cur_time,
             &Duration::from_secs(5),
             &Duration::from_secs(1),
             [].into_iter(),
             None,
+        );
+    }
+
+    fn update_containers(
+        &mut self,
+        cur_time: &Duration,
+        character_infos: &PoolFxLinkedHashMap<CharacterId, CharacterInfo>,
+    ) {
+        Self::update_containers_impl(
+            &mut self.containers,
+            &mut self.map_vote_thumbnails_container,
+            cur_time,
+            character_infos.values().map(|i| &***i.info),
         );
     }
 }
@@ -2712,10 +2777,11 @@ impl RenderGameInterface for RenderGame {
         res
     }
 
-    fn continue_map_loading(&mut self) -> Result<bool, String> {
+    fn continue_loading(&mut self) -> Result<bool, String> {
+        let containers_loaded = self.check_required_containers_loaded();
         self.map
             .continue_loading()
-            .map(|m| m.is_some())
+            .map(|m| m.is_some() && containers_loaded)
             .map_err(|err| err.to_string())
     }
 

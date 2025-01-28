@@ -9,10 +9,11 @@ pub mod state {
     use base::linked_hash_map_view::FxLinkedHashMap;
     use base::network_string::{NetworkReducedAsciiString, NetworkString};
     use base_io::runtime::{IoRuntime, IoRuntimeTask};
-    use command_parser::parser::{CommandArg, CommandArgType, CommandType, ParserCache, Syn};
+    use command_parser::parser::{self, CommandArg, CommandArgType, CommandType, ParserCache, Syn};
     use config::parsing::parse_conf_values_as_str_list;
     use config::traits::ConfigInterface;
     use ddnet_accounts_types::account_id::AccountId;
+    use game_base::config_helper::handle_config_variable_cmd;
     use game_database::traits::DbInterface;
     use game_interface::account_info::MAX_ACCOUNT_NAME_LEN;
     use game_interface::chat_commands::ChatCommands;
@@ -25,7 +26,7 @@ pub mod state {
     };
     use game_interface::ghosts::GhostResult;
     use game_interface::pooling::GamePooling;
-    use game_interface::rcon_commands::{AuthLevel, ExecRconCommand, RconCommand, RconCommands};
+    use game_interface::rcon_entries::{AuthLevel, ExecRconInput, RconEntries, RconEntry};
     use game_interface::settings::GameStateSettings;
     use game_interface::tick_result::TickResult;
     use game_interface::types::character_info::{
@@ -88,7 +89,7 @@ pub mod state {
 
     use crate::collision::collision::Tunings;
     use crate::command_chain::{Command, CommandChain};
-    use crate::config::config::{ConfigGameType, ConfigVanilla};
+    use crate::config::config::{ConfigGameType, ConfigVanilla, ConfigVanillaWrapper};
     use crate::entities::character::character::{self, CharacterPlayerTy};
     use crate::entities::character::core::character_core::Core;
     use crate::entities::character::player::player::{
@@ -136,6 +137,7 @@ pub mod state {
     pub enum VanillaRconCommand {
         Info,
         Cheats(VanillaRconCommandCheat),
+        ConfVariable,
     }
 
     pub struct Game {
@@ -203,7 +205,6 @@ pub mod state {
 
         // game
         pub(crate) game_options: GameOptions,
-        config: ConfigVanilla,
 
         pub(crate) chat_commands: ChatCommands,
         pub(crate) rcon_chain: CommandChain<VanillaRconCommand>,
@@ -226,7 +227,7 @@ pub mod state {
     impl GameState {
         fn get_game_type_from_conf(conf: ConfigGameType) -> GameType {
             match conf {
-                ConfigGameType::Ctf => GameType::Team,
+                ConfigGameType::Ctf => GameType::Sided,
                 ConfigGameType::Dm => GameType::Solo,
             }
         }
@@ -244,6 +245,65 @@ pub mod state {
             matches!(conf, ConfigGameType::Ctf)
         }
 
+        /// Returns the unhandled commands
+        fn handle_initial_args(
+            lines: Vec<String>,
+            config: &mut ConfigVanilla,
+            rcon_chain: &CommandChain<VanillaRconCommand>,
+            cache: &ParserCache,
+        ) -> (
+            Vec<Result<NetworkString<65536>, NetworkString<65536>>>,
+            Vec<parser::Command>,
+        ) {
+            let mut res: Vec<Result<NetworkString<65536>, NetworkString<65536>>> =
+                Default::default();
+            let mut res_cmds: Vec<parser::Command> = Default::default();
+            for line in lines {
+                let cmds = command_parser::parser::parse(&line, &rcon_chain.parser, cache);
+                for cmd in cmds {
+                    let handle_cmd = || match cmd {
+                        CommandType::Full(cmd) => {
+                            let Some(chain_cmd) = rcon_chain.by_ident(&cmd.ident) else {
+                                return Err(anyhow!("Rcon command {} was not found", cmd.ident));
+                            };
+
+                            match chain_cmd.cmd {
+                                VanillaRconCommand::ConfVariable => {
+                                    let mut van_config = ConfigVanillaWrapper {
+                                        vanilla: config.clone(),
+                                    };
+                                    match handle_config_variable_cmd(&cmd, &mut van_config).map(
+                                        |msg| {
+                                            format!("Updated value for {}: {}", cmd.cmd_text, msg)
+                                        },
+                                    ) {
+                                        Ok(res) => {
+                                            *config = van_config.vanilla;
+                                            Ok(res)
+                                        }
+                                        Err(err) => Err(err),
+                                    }
+                                }
+                                _ => {
+                                    res_cmds.push(cmd);
+                                    Ok("".into())
+                                }
+                            }
+                        }
+                        CommandType::Partial(cmd) => Err(anyhow!(
+                            "Initial args expect full command, but was invalid: {cmd}"
+                        )),
+                    };
+
+                    match handle_cmd() {
+                        Ok(msg) => res.push(Ok(NetworkString::new_lossy(msg))),
+                        Err(err) => res.push(Err(NetworkString::new_lossy(err.to_string()))),
+                    }
+                }
+            }
+            (res, res_cmds)
+        }
+
         fn new_impl(
             map: Vec<u8>,
             map_name: NetworkReducedAsciiString<MAX_MAP_NAME_LEN>,
@@ -254,6 +314,128 @@ pub mod state {
         where
             Self: Sized,
         {
+            let rcon_cmds = vec![
+                (
+                    "info".try_into().unwrap(),
+                    Command {
+                        rcon: RconEntry {
+                            args: Default::default(),
+                            description: "Prints information about this modification"
+                                .try_into()
+                                .unwrap(),
+                            usage: "".try_into().unwrap(),
+                        },
+                        cmd: VanillaRconCommand::Info,
+                    },
+                ),
+                (
+                    "cheats.all_weapons".try_into().unwrap(),
+                    Command {
+                        rcon: RconEntry {
+                            args: Default::default(),
+                            description: "Gives the player all weapons (cheat)".try_into().unwrap(),
+                            usage: "".try_into().unwrap(),
+                        },
+                        cmd: VanillaRconCommand::Cheats(VanillaRconCommandCheat::WeaponsAll),
+                    },
+                ),
+                (
+                    "cheats.tune".try_into().unwrap(),
+                    Command {
+                        rcon: RconEntry {
+                            description: "Tunes a physics value to a given value"
+                                .try_into()
+                                .unwrap(),
+                            usage: "<name> <val>".try_into().unwrap(),
+                            args: vec![
+                                CommandArg {
+                                    ty: CommandArgType::TextFrom({
+                                        let mut names: Vec<NetworkString<65536>> =
+                                            Default::default();
+
+                                        parse_conf_values_as_str_list(
+                                            "".into(),
+                                            &mut |entry, _| {
+                                                names.push(entry.name.as_str().try_into().unwrap());
+                                            },
+                                            Tunings::conf_value(),
+                                            "".into(),
+                                            Default::default(),
+                                        );
+
+                                        names
+                                    }),
+                                    user_ty: None,
+                                },
+                                CommandArg {
+                                    ty: CommandArgType::Float,
+                                    user_ty: None,
+                                },
+                            ],
+                        },
+                        cmd: VanillaRconCommand::Cheats(VanillaRconCommandCheat::Tune),
+                    },
+                ),
+            ];
+
+            let mut rcon_vars: Vec<_> = Default::default();
+            config::parsing::parse_conf_values_as_str_list(
+                "".into(),
+                &mut |add, _| {
+                    rcon_vars.push((
+                        add.name.try_into().unwrap(),
+                        Command {
+                            rcon: RconEntry {
+                                args: add.args,
+                                usage: add.usage.as_str().try_into().unwrap(),
+                                description: add.description.as_str().try_into().unwrap(),
+                            },
+                            cmd: VanillaRconCommand::ConfVariable,
+                        },
+                    ));
+                },
+                ConfigVanillaWrapper::conf_value(),
+                "".into(),
+                Default::default(),
+            );
+
+            let rcon_chain = CommandChain::new(
+                rcon_cmds.into_iter().collect(),
+                rcon_vars.into_iter().collect(),
+            );
+
+            let cache = Default::default();
+
+            let rcon_commands = RconEntries {
+                cmds: rcon_chain
+                    .cmd_list()
+                    .iter()
+                    .map(|(name, cmd)| (name.clone(), cmd.rcon.clone()))
+                    .collect(),
+                vars: rcon_chain
+                    .var_list()
+                    .iter()
+                    .map(|(name, cmd)| (name.clone(), cmd.rcon.clone()))
+                    .collect(),
+            };
+
+            let mut config: ConfigVanilla = options
+                .config
+                .and_then(|config| serde_json::from_slice(&config).ok())
+                .unwrap_or_default();
+            let write_config = config.clone();
+
+            let (mut initial_args_res, remaining_cmds) = Self::handle_initial_args(
+                options
+                    .initial_rcon_input
+                    .into_iter()
+                    .map(|r| r.raw.into())
+                    .collect(),
+                &mut config,
+                &rcon_chain,
+                &cache,
+            );
+
             let db_task = io_rt.spawn(async move {
                 if !db.kinds().is_empty() {
                     if let Err(err) = save::setup(db.clone()).await {
@@ -317,101 +499,17 @@ pub mod state {
             });
             let id_generator = IdGenerator::new();
 
-            let config: ConfigVanilla = options
-                .config
-                .and_then(|config| serde_json::from_slice(&config).ok())
-                .unwrap_or_default();
-
             let game_type = Self::get_game_type_from_conf(config.game_type);
 
             let (statements, account_info) = db_task.get_storage().ok().flatten().unzip();
+
+            let has_accounts = account_info.is_some();
 
             let chat_commands = ChatCommands {
                 cmds: vec![("account_info".try_into().unwrap(), vec![])]
                     .into_iter()
                     .collect(),
                 prefixes: vec!['/'],
-            };
-            let rcon_chain = CommandChain::new(
-                vec![
-                    (
-                        "info".try_into().unwrap(),
-                        Command {
-                            rcon: RconCommand {
-                                args: Default::default(),
-                                description: "Prints information about this modification"
-                                    .try_into()
-                                    .unwrap(),
-                                usage: "".try_into().unwrap(),
-                            },
-                            cmd: VanillaRconCommand::Info,
-                        },
-                    ),
-                    (
-                        "cheats.all_weapons".try_into().unwrap(),
-                        Command {
-                            rcon: RconCommand {
-                                args: Default::default(),
-                                description: "Gives the player all weapons (cheat)"
-                                    .try_into()
-                                    .unwrap(),
-                                usage: "".try_into().unwrap(),
-                            },
-                            cmd: VanillaRconCommand::Cheats(VanillaRconCommandCheat::WeaponsAll),
-                        },
-                    ),
-                    (
-                        "cheats.tune".try_into().unwrap(),
-                        Command {
-                            rcon: RconCommand {
-                                description: "Tunes a physics value to a given value"
-                                    .try_into()
-                                    .unwrap(),
-                                usage: "<name> <val>".try_into().unwrap(),
-                                args: vec![
-                                    CommandArg {
-                                        ty: CommandArgType::TextFrom({
-                                            let mut names: Vec<NetworkString<65536>> =
-                                                Default::default();
-
-                                            parse_conf_values_as_str_list(
-                                                "".into(),
-                                                &mut |entry, _| {
-                                                    names.push(
-                                                        entry.name.as_str().try_into().unwrap(),
-                                                    );
-                                                },
-                                                Tunings::conf_value(),
-                                                "".into(),
-                                                Default::default(),
-                                            );
-
-                                            names
-                                        }),
-                                        user_ty: None,
-                                    },
-                                    CommandArg {
-                                        ty: CommandArgType::Float,
-                                        user_ty: None,
-                                    },
-                                ],
-                            },
-                            cmd: VanillaRconCommand::Cheats(VanillaRconCommandCheat::Tune),
-                        },
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            );
-
-            let has_accounts = account_info.is_some();
-
-            let rcon_commands = RconCommands {
-                cmds: rcon_chain
-                    .cmds
-                    .iter()
-                    .map(|(name, cmd)| (name.clone(), cmd.rcon.clone()))
-                    .collect(),
             };
 
             let mut game = Self {
@@ -450,26 +548,10 @@ pub mod state {
                 }),
 
                 // game
-                game_options: GameOptions::new(
-                    game_type,
-                    config.score_limit,
-                    if config.time_limit_secs > 0 {
-                        Some(Duration::from_secs(config.time_limit_secs))
-                    } else {
-                        None
-                    },
-                    if config.auto_side_balance_secs > 0 {
-                        Some(Duration::from_secs(config.auto_side_balance_secs))
-                    } else {
-                        None
-                    },
-                    config.friendly_fire,
-                    config.laser_hit_self,
-                ),
-                config: config.clone(),
+                game_options: GameOptions::new(game_type, config.clone()),
                 chat_commands: chat_commands.clone(),
                 rcon_chain,
-                cache: Default::default(),
+                cache,
                 map_name,
 
                 // db
@@ -495,13 +577,25 @@ pub mod state {
                 snap_shot_manager: SnapshotManager::new(&Default::default()),
             };
             game.stage_0_id = game.add_stage(Default::default(), ubvec4::new(0, 0, 0, 0));
+
+            for cmd in remaining_cmds {
+                match game.handle_full_command(None, cmd) {
+                    Ok(res) => initial_args_res.push(Ok(NetworkString::new_lossy(res))),
+                    Err(err) => {
+                        initial_args_res.push(Err(NetworkString::new_lossy(err.to_string())))
+                    }
+                }
+            }
+
             Ok((
                 game,
                 GameStateStaticInfo {
                     ticks_in_a_second: NonZero::new(TICKS_PER_SECOND).unwrap(),
                     chat_commands,
                     rcon_commands,
-                    config: serde_json::to_vec(&config).ok(),
+
+                    config: serde_json::to_vec(&write_config).ok(),
+                    initial_rcon_response: initial_args_res,
 
                     mod_name: Self::get_mod_name_from_conf(config.game_type),
                     version: "pre-alpha".try_into().unwrap(),
@@ -921,108 +1015,143 @@ pub mod state {
             }
         }
 
+        fn handle_full_command(
+            &mut self,
+            player_id: Option<&PlayerId>,
+            mut cmd: parser::Command,
+        ) -> anyhow::Result<String> {
+            let Some(chain_cmd) = self.rcon_chain.by_ident(&cmd.ident) else {
+                return Err(anyhow!("Rcon command {} was not found", cmd.ident));
+            };
+
+            match chain_cmd.cmd {
+                VanillaRconCommand::Info => {
+                    self.game
+                        .stages
+                        .get(&self.stage_0_id)
+                        .unwrap()
+                        .game_pending_events
+                        .push(GameWorldEvent::Notification(
+                            GameWorldNotificationEvent::System(GameWorldSystemMessage::Custom({
+                                let mut s = self.game_pools.mt_network_string_common_pool.new();
+                                s.try_set("You are playing vanilla.").unwrap();
+                                s
+                            })),
+                        ));
+                    anyhow::Ok("You are playing vanilla.".to_string())
+                }
+                VanillaRconCommand::Cheats(cheat) => match cheat {
+                    VanillaRconCommandCheat::WeaponsAll => {
+                        let Some(player_id) = player_id else {
+                            return Err(anyhow!(
+                                "Weapon cheat command must be executed by an actual player"
+                            ));
+                        };
+                        let Some(character_info) = self.game.players.player(player_id) else {
+                            return Err(anyhow!("The given player was not found in this game"));
+                        };
+                        if let Some(character) = self
+                            .game
+                            .stages
+                            .get_mut(&character_info.stage_id())
+                            .and_then(|stage| stage.world.characters.get_mut(player_id))
+                        {
+                            let reusable_core = &mut character.reusable_core;
+                            let gun = Weapon {
+                                cur_ammo: Some(10),
+                                next_ammo_regeneration_tick: 0.into(),
+                            };
+                            reusable_core.weapons.insert(WeaponType::Gun, gun);
+                            reusable_core.weapons.insert(WeaponType::Shotgun, gun);
+                            reusable_core.weapons.insert(WeaponType::Grenade, gun);
+                            reusable_core.weapons.insert(WeaponType::Laser, gun);
+
+                            Ok("Cheated all weapons!".to_string())
+                        } else {
+                            Err(anyhow!("The given player was not found in this game"))
+                        }
+                    }
+                    VanillaRconCommandCheat::Tune => {
+                        let Some(Syn::Float(val)) = cmd.args.pop().map(|(name, _)| name) else {
+                            panic!("Expected a float, this is an implementation bug");
+                        };
+                        let Some(Syn::Text(path)) = cmd.args.pop().map(|(name, _)| name) else {
+                            panic!("Expected a text, this is an implementation bug");
+                        };
+
+                        match self.collision.tune_zones[0].try_set_from_str(
+                            path,
+                            None,
+                            Some(val),
+                            None,
+                            Default::default(),
+                        ) {
+                            Ok(res) => Ok(res),
+                            Err(err) => {
+                                log::error!("{err}");
+                                Err(err.into())
+                            }
+                        }
+                    }
+                },
+                VanillaRconCommand::ConfVariable => {
+                    let mut config = ConfigVanillaWrapper {
+                        vanilla: self.game_options.config_clone(),
+                    };
+                    match handle_config_variable_cmd(&cmd, &mut config)
+                        .map(|msg| format!("Updated value for {}: {}", cmd.cmd_text, msg))
+                    {
+                        Ok(res) => {
+                            self.game_options.replace_conf(config.vanilla);
+                            Ok(res)
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+            }
+        }
+
         fn handle_rcon_commands(
             &mut self,
             player_id: Option<&PlayerId>,
             _auth: AuthLevel,
             cmds: Vec<CommandType>,
-        ) -> Vec<NetworkString<65536>> {
-            let mut res: Vec<NetworkString<65536>> = Default::default();
+        ) -> Vec<Result<NetworkString<65536>, NetworkString<65536>>> {
+            let mut res: Vec<Result<NetworkString<65536>, NetworkString<65536>>> =
+                Default::default();
             for cmd in cmds {
                 let handle_cmd = || match cmd {
-                    CommandType::Full(mut cmd) => {
-                        let Some(chain_cmd) = self.rcon_chain.cmds.get(&cmd.ident) else {
-                            return Err(anyhow!("Rcon command {} was not found", cmd.ident));
+                    CommandType::Full(cmd) => self.handle_full_command(player_id, cmd),
+                    CommandType::Partial(cmd) => {
+                        let Some(cmd) = cmd.ref_cmd_partial() else {
+                            return Err(anyhow!("This command was invalid: {cmd}"));
+                        };
+                        let Some(chain_cmd) = self.rcon_chain.by_ident(&cmd.ident) else {
+                            return Err(anyhow!("Command {} not found", cmd.ident));
                         };
 
-                        match chain_cmd.cmd {
-                            VanillaRconCommand::Info => {
-                                self.game
-                                    .stages
-                                    .get(&self.stage_0_id)
-                                    .unwrap()
-                                    .game_pending_events
-                                    .push(GameWorldEvent::Notification(
-                                        GameWorldNotificationEvent::System(
-                                            GameWorldSystemMessage::Custom({
-                                                let mut s = self
-                                                    .game_pools
-                                                    .mt_network_string_common_pool
-                                                    .new();
-                                                s.try_set("You are playing vanilla.").unwrap();
-                                                s
-                                            }),
-                                        ),
-                                    ));
-                                anyhow::Ok("You are playing vanilla.".to_string())
+                        if let VanillaRconCommand::ConfVariable = chain_cmd.cmd {
+                            let mut config = ConfigVanillaWrapper {
+                                vanilla: self.game_options.config_clone(),
+                            };
+                            match handle_config_variable_cmd(cmd, &mut config)
+                                .map(|msg| format!("Current value for {}: {}", cmd.cmd_text, msg))
+                            {
+                                Ok(res) => {
+                                    self.game_options.replace_conf(config.vanilla);
+                                    Ok(res)
+                                }
+                                Err(err) => Err(err),
                             }
-                            VanillaRconCommand::Cheats(cheat) => match cheat {
-                                VanillaRconCommandCheat::WeaponsAll => {
-                                    let Some(player_id) = player_id else {
-                                        return Err(anyhow!("Weapon cheat command must be executed by an actual player"));
-                                    };
-                                    let Some(character_info) = self.game.players.player(player_id)
-                                    else {
-                                        return Err(anyhow!(
-                                            "The given player was not found in this game"
-                                        ));
-                                    };
-                                    if let Some(character) = self
-                                        .game
-                                        .stages
-                                        .get_mut(&character_info.stage_id())
-                                        .and_then(|stage| stage.world.characters.get_mut(player_id))
-                                    {
-                                        let reusable_core = &mut character.reusable_core;
-                                        let gun = Weapon {
-                                            cur_ammo: Some(10),
-                                            next_ammo_regeneration_tick: 0.into(),
-                                        };
-                                        reusable_core.weapons.insert(WeaponType::Gun, gun);
-                                        reusable_core.weapons.insert(WeaponType::Shotgun, gun);
-                                        reusable_core.weapons.insert(WeaponType::Grenade, gun);
-                                        reusable_core.weapons.insert(WeaponType::Laser, gun);
-
-                                        Ok("Cheated all weapons!".to_string())
-                                    } else {
-                                        Err(anyhow!("The given player was not found in this game"))
-                                    }
-                                }
-                                VanillaRconCommandCheat::Tune => {
-                                    let Some(Syn::Float(val)) =
-                                        cmd.args.pop().map(|(name, _)| name)
-                                    else {
-                                        panic!("Expected a float, this is an implementation bug");
-                                    };
-                                    let Some(Syn::Text(path)) =
-                                        cmd.args.pop().map(|(name, _)| name)
-                                    else {
-                                        panic!("Expected a text, this is an implementation bug");
-                                    };
-
-                                    match self.collision.tune_zones[0].try_set_from_str(
-                                        path,
-                                        None,
-                                        Some(val),
-                                        None,
-                                        Default::default(),
-                                    ) {
-                                        Ok(res) => Ok(res),
-                                        Err(err) => {
-                                            log::error!("{err}");
-                                            Err(err.into())
-                                        }
-                                    }
-                                }
-                            },
+                        } else {
+                            Err(anyhow!("Failed to handle config variable: {cmd}"))
                         }
                     }
-                    CommandType::Partial(res) => Err(anyhow!("{res}")),
                 };
 
                 match handle_cmd() {
-                    Ok(msg) => res.push(NetworkString::new_lossy(msg)),
-                    Err(err) => res.push(NetworkString::new_lossy(err.to_string())),
+                    Ok(msg) => res.push(Ok(NetworkString::new_lossy(msg))),
+                    Err(err) => res.push(Err(NetworkString::new_lossy(err.to_string()))),
                 }
             }
             res
@@ -1447,7 +1576,7 @@ pub mod state {
             }
         }
 
-        fn chech_player_info(
+        fn check_player_info(
             &self,
             mut info: NetworkCharacterInfo,
             player_id: Option<PlayerId>,
@@ -1583,12 +1712,12 @@ pub mod state {
                                 skin_info: match character_game_info.and_then(|side| side) {
                                     Some(side) => match side {
                                         MatchSide::Red => NetworkSkinInfo::Custom {
-                                            body_color: ubvec4::new(255, 0, 0, 255),
-                                            feet_color: ubvec4::new(255, 0, 0, 255),
+                                            body_color: ubvec4::new(255, 107, 107, 255),
+                                            feet_color: ubvec4::new(255, 107, 107, 255),
                                         },
                                         MatchSide::Blue => NetworkSkinInfo::Custom {
-                                            body_color: ubvec4::new(0, 0, 255, 255),
-                                            feet_color: ubvec4::new(0, 0, 255, 255),
+                                            body_color: ubvec4::new(107, 159, 255, 255),
+                                            feet_color: ubvec4::new(107, 159, 255, 255),
                                         },
                                     },
                                     None => {
@@ -1755,7 +1884,7 @@ pub mod state {
                 stage.characters.sort_by_key(|c| std::cmp::Reverse(c.score));
             }
 
-            let ty = self.game_options.ty;
+            let ty = self.game_options.ty();
             Scoreboard {
                 game: match ty {
                     GameType::Solo => ScoreboardGameType::SoloPlay {
@@ -1763,7 +1892,7 @@ pub mod state {
                         ignore_stage: self.stage_0_id,
                         spectator_players: spectator_scoreboard_infos,
                     },
-                    GameType::Team => ScoreboardGameType::SidedPlay {
+                    GameType::Sided => ScoreboardGameType::SidedPlay {
                         red_stages: red_or_solo_stage_infos,
                         blue_stages: blue_stage_infos,
                         ignore_stage: self.stage_0_id,
@@ -1788,8 +1917,8 @@ pub mod state {
                         name
                     },
                     ty: ScoreboardGameTypeOptions::Match {
-                        score_limit: self.game_options.score_limit,
-                        time_limit: self.game_options.time_limit,
+                        score_limit: self.game_options.score_limit(),
+                        time_limit: self.game_options.time_limit(),
                     },
                 },
             }
@@ -1872,7 +2001,7 @@ pub mod state {
                                 .game_match
                                 .state
                                 .round_ticks_left(&prev_stage.world, &self.game_pools),
-                            unbalanced: self.game_options.sided_balance_time.is_some()
+                            unbalanced: self.game_options.sided_balance_time().is_some()
                                 && MatchManager::needs_sided_balance(&prev_stage.world),
                         },
                         game_ticks_passed: prev_stage.match_manager.game_match.state.passed_ticks(),
@@ -1941,7 +2070,7 @@ pub mod state {
             let player_id = self.id_generator.next_id();
             let stage_0_id = self.stage_0_id;
 
-            let character_info = self.chech_player_info(client_player_info.info.clone(), None);
+            let character_info = self.check_player_info(client_player_info.info.clone(), None);
 
             self.game
                 .stages
@@ -1991,7 +2120,7 @@ pub mod state {
                 .world
                 .characters
                 .len()
-                < self.config.max_ingame_players as usize
+                < self.game_options.max_ingame_players() as usize
             {
                 // spawn and send character info
                 let default_eyes = player_info.player_info.default_eyes;
@@ -2095,7 +2224,7 @@ pub mod state {
             version: NonZeroU64,
         ) {
             let old_info = &mut None;
-            let new_info = self.chech_player_info(info.clone(), Some(*id));
+            let new_info = self.check_player_info(info.clone(), Some(*id));
             let mut stage_id = self.stage_0_id;
             if let Some(player) = self.game.players.player(id) {
                 stage_id = player.stage_id();
@@ -2307,8 +2436,8 @@ pub mod state {
 
         fn settings(&self) -> GameStateSettings {
             GameStateSettings {
-                max_ingame_players: self.config.max_ingame_players,
-                tournament_mode: self.config.tournament_mode,
+                max_ingame_players: self.game_options.max_ingame_players(),
+                tournament_mode: self.game_options.tournament_mode(),
             }
         }
 
@@ -2331,13 +2460,13 @@ pub mod state {
                     let cmds = command_parser::parser::parse(
                         &cmd.raw,
                         &self.chat_commands.cmds,
-                        &mut self.cache,
+                        &self.cache,
                     );
                     self.handle_chat_commands(player_id, cmds);
                 }
                 ClientCommand::JoinStage(join_stage) => {
-                    if self.config.allow_stages
-                        || (!Self::is_sided_from_conf(self.config.game_type)
+                    if self.game_options.allow_stages()
+                        || (!Self::is_sided_from_conf(self.game_options.game_ty())
                             && matches!(join_stage, JoinStage::Default))
                     {
                         let stage_id = match join_stage {
@@ -2420,7 +2549,7 @@ pub mod state {
                     }
                 }
                 ClientCommand::JoinSide(side) => {
-                    if Self::is_sided_from_conf(self.config.game_type) {
+                    if Self::is_sided_from_conf(self.game_options.game_ty()) {
                         if let Some(player) = self.game.players.player(player_id) {
                             let stage = self.game.stages.get_mut(&player.stage_id()).unwrap();
                             if let Some(character) = stage.world.characters.get_mut(player_id) {
@@ -2474,19 +2603,16 @@ pub mod state {
         fn rcon_command(
             &mut self,
             player_id: Option<PlayerId>,
-            cmd: ExecRconCommand,
-        ) -> Vec<NetworkString<65536>> {
+            cmd: ExecRconInput,
+        ) -> Vec<Result<NetworkString<65536>, NetworkString<65536>>> {
             if !matches!(cmd.auth_level, AuthLevel::None) {
-                let cmds = command_parser::parser::parse(
-                    &cmd.raw,
-                    &self.rcon_chain.parser,
-                    &mut self.cache,
-                );
+                let cmds =
+                    command_parser::parser::parse(&cmd.raw, &self.rcon_chain.parser, &self.cache);
                 self.handle_rcon_commands(player_id.as_ref(), cmd.auth_level, cmds)
             } else {
-                vec!["Only moderators or admins can execute rcon commands"
+                vec![Err("Only moderators or admins can execute rcon commands"
                     .try_into()
-                    .unwrap()]
+                    .unwrap())]
             }
         }
 
@@ -2510,11 +2636,8 @@ pub mod state {
                     }
                 }
                 VoteCommand::Misc(cmd) => {
-                    let cmds = command_parser::parser::parse(
-                        &cmd,
-                        &self.rcon_chain.parser,
-                        &mut self.cache,
-                    );
+                    let cmds =
+                        command_parser::parser::parse(&cmd, &self.rcon_chain.parser, &self.cache);
                     self.handle_rcon_commands(None, AuthLevel::Admin, cmds);
                 }
                 VoteCommand::RandomUnfinishedMap(_) => {
